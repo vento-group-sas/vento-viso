@@ -88,16 +88,16 @@ function AppTile({
   onNavigate: () => void;
 }) {
   const isEnabled = app.access === "enabled";
-  const isHub = app.id === "hub";
+  const isShell = app.id === "shell";
   const [logoError, setLogoError] = useState(false);
   const fallback = app.name.slice(0, 1);
 
-  const iconWrapStyle = isHub
+  const iconWrapStyle = isShell
     ? { width: 92, height: 50, maxWidth: "100%" }
     : undefined;
 
-  const logoWidth = isHub ? 84 : 40;
-  const logoHeight = isHub ? 44 : 40;
+  const logoWidth = isShell ? 84 : 40;
+  const logoHeight = isShell ? 44 : 40;
 
   const logoClassName =
     app.access === "enabled"
@@ -112,7 +112,7 @@ function AppTile({
   const logoNode = logoError ? (
     <div
       className={fallbackClassName}
-      style={isHub ? { width: logoWidth, height: logoHeight } : undefined}
+      style={isShell ? { width: logoWidth, height: logoHeight } : undefined}
     >
       {fallback}
     </div>
@@ -124,7 +124,7 @@ function AppTile({
       width={logoWidth}
       height={logoHeight}
       unoptimized
-      style={isHub ? { width: logoWidth, height: logoHeight, objectFit: "contain" } : undefined}
+      style={isShell ? { width: logoWidth, height: logoHeight, objectFit: "contain" } : undefined}
       onError={() => setLogoError(true)}
     />
   );

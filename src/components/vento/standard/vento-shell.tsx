@@ -1,4 +1,4 @@
-﻿import { cookies } from "next/headers";
+import { cookies } from "next/headers";
 
 import { checkPermissionWithRoleOverride } from "@/lib/auth/role-override";
 import { checkOperationalRolePermission } from "@/lib/auth/operational-session";
@@ -126,19 +126,13 @@ type NavGroup = {
 
 type SupabaseClient = Awaited<ReturnType<typeof createClient>>;
 
-const APP_ENTITY =
-  (process.env.NEXT_PUBLIC_VENTO_ENTITY?.toLowerCase() as
-    | "default"
-    | "nexo"
-    | "fogo"
-    | "pulso"
-    | "viso"
-    | "origo"
-    | "numera"
-    | "anima"
-    | "aura") ?? "viso";
+type CanonicalAppCode = "shell" | "anima" | "viso" | "nexo" | "fogo" | "origo" | "pulso" | "numera" | "aura" | "pass";
+type LocalAppEntity = "default" | Exclude<CanonicalAppCode, "shell" | "pass">;
 
-const APP_CODE = APP_ENTITY === "default" ? "viso" : APP_ENTITY;
+const APP_ENTITY =
+  (process.env.NEXT_PUBLIC_VENTO_ENTITY?.toLowerCase() as LocalAppEntity) ?? "viso";
+
+const APP_CODE: CanonicalAppCode = APP_ENTITY === "default" ? "viso" : APP_ENTITY;
 
 const PRIVILEGED_WORK_CONTEXT_BYPASS_ROLES = new Set([
   "propietario",
@@ -162,96 +156,16 @@ const ICON_NAMES = new Set<IconName>([
 ]);
 
 const APP_SWITCHER_ITEMS: Omit<AppSwitcherItem, "access">[] = [
-  {
-    id: "hub",
-    name: "Hub",
-    description: "Launcher del ecosistema.",
-    logoSrc: "/apps/hub.svg",
-    brandColor: "#111827",
-    href: "https://os.ventogroup.co",
-    status: "active",
-    group: "Workspace",
-  },
-  {
-    id: "anima",
-    name: "ANIMA",
-    description: "Jornadas y asistencia.",
-    logoSrc: "/apps/anima.svg",
-    brandColor: "#14B8A6",
-    href: "https://anima.ventogroup.co",
-    status: "active",
-    group: "Workspace",
-  },
-  {
-    id: "nexo",
-    name: "NEXO",
-    description: "Inventario y logística.",
-    logoSrc: "/apps/nexo.svg",
-    brandColor: "#F59E0B",
-    href: "https://nexo.ventogroup.co",
-    status: "active",
-    group: "Operacion",
-  },
-  {
-    id: "origo",
-    name: "ORIGO",
-    description: "Compras y proveedores.",
-    logoSrc: "/apps/origo.svg",
-    brandColor: "#0EA5E9",
-    href: "https://origo.ventogroup.co",
-    status: "active",
-    group: "Operacion",
-  },
-  {
-    id: "pulso",
-    name: "PULSO",
-    description: "POS y ventas.",
-    logoSrc: "/apps/pulso.svg",
-    brandColor: "#EF4444",
-    href: "https://pulso.ventogroup.co",
-    status: "active",
-    group: "Operacion",
-  },
-  {
-    id: "numera",
-    name: "NUMERA",
-    description: "Economia y rentabilidad.",
-    logoSrc: "/apps/numera.svg",
-    brandColor: "#2563EB",
-    href: "https://numera.ventogroup.co",
-    status: "active",
-    group: "Operacion",
-  },
-  {
-    id: "viso",
-    name: "VISO",
-    description: "Gerencia y auditoria.",
-    logoSrc: "/apps/viso.svg",
-    brandColor: "#A855F7",
-    href: "https://viso.ventogroup.co",
-    status: "active",
-    group: "Operacion",
-  },
-  {
-    id: "fogo",
-    name: "FOGO",
-    description: "Recetas y producción.",
-    logoSrc: "/apps/fogo.svg",
-    brandColor: "#FB7185",
-    href: "https://fogo.ventogroup.co",
-    status: "active",
-    group: "Operacion",
-  },
-  {
-    id: "aura",
-    name: "AURA",
-    description: "Marketing y contenido.",
-    logoSrc: "/apps/aura.svg",
-    brandColor: "#A855F7",
-    href: "https://aura.ventogroup.co",
-    status: "soon",
-    group: "Proximamente",
-  },
+  { id: "shell", name: "Vento OS", description: "Launcher del ecosistema.", logoSrc: "/apps/hub.svg", brandColor: "#111827", href: "https://os.ventogroup.co", status: "active", group: "Workspace" },
+  { id: "anima", name: "ANIMA", description: "Jornadas y asistencia.", logoSrc: "/apps/anima.svg", brandColor: "#14B8A6", href: "https://anima.ventogroup.co", status: "active", group: "Workspace" },
+  { id: "viso", name: "VISO", description: "Gerencia y auditoria.", logoSrc: "/apps/viso.svg", brandColor: "#A855F7", href: "https://viso.ventogroup.co", status: "active", group: "Operacion" },
+  { id: "nexo", name: "NEXO", description: "Inventario y logistica.", logoSrc: "/apps/nexo.svg", brandColor: "#F59E0B", href: "https://nexo.ventogroup.co", status: "active", group: "Operacion" },
+  { id: "fogo", name: "FOGO", description: "Recetas y produccion.", logoSrc: "/apps/fogo.svg", brandColor: "#FB7185", href: "https://fogo.ventogroup.co", status: "active", group: "Operacion" },
+  { id: "origo", name: "ORIGO", description: "Compras y proveedores.", logoSrc: "/apps/origo.svg", brandColor: "#0EA5E9", href: "https://origo.ventogroup.co", status: "active", group: "Operacion" },
+  { id: "pulso", name: "PULSO", description: "POS y ventas.", logoSrc: "/apps/pulso.svg", brandColor: "#EF4444", href: "https://pulso.ventogroup.co", status: "active", group: "Operacion" },
+  { id: "numera", name: "NUMERA", description: "Economia y rentabilidad.", logoSrc: "/apps/numera.svg", brandColor: "#2563EB", href: "https://numera.ventogroup.co", status: "active", group: "Operacion" },
+  { id: "aura", name: "AURA", description: "Identidad canonica diferida.", logoSrc: "/apps/aura.svg", brandColor: "#A855F7", href: "", status: "soon", group: "Proximamente" },
+  { id: "pass", name: "Vento Pass", description: "Cliente sin destino web aprobado.", logoSrc: "/apps/pass.svg", brandColor: "#0F766E", href: "", status: "soon", group: "Proximamente" },
 ];
 
 function asId(value: unknown) {
@@ -506,7 +420,7 @@ function resolveAllowedAppsForSharedDevice(
   const allowedAppCodes = new Set(normalizeAppCodes(sharedDevice.allowed_app_codes));
 
   return APP_SWITCHER_ITEMS.map((app): AppSwitcherItem => {
-    if (app.id === "hub" || app.id === "anima") {
+    if (app.id === "shell" || app.id === "anima") {
       return {
         ...app,
         access: "enabled",
@@ -639,7 +553,7 @@ async function resolveAllowedApps({
 }): Promise<AppSwitcherItem[]> {
   const resolved = await Promise.all(
     APP_SWITCHER_ITEMS.map(async (app): Promise<AppSwitcherItem> => {
-      if (app.id === "hub") {
+      if (app.id === "shell") {
         return {
           ...app,
           access: "enabled",
@@ -840,7 +754,7 @@ export async function VentoShell({ children }: { children: React.ReactNode }) {
       activeWorkContext = resolvedActiveWorkContext;
 
       const employeeSiteRows = (employeeSites ?? []) as EmployeeSiteRow[];
-      
+
 
       const assignedSiteIds = uniqueIds([
         activeWorkContext?.siteId ?? null,
@@ -933,7 +847,7 @@ export async function VentoShell({ children }: { children: React.ReactNode }) {
 
         appSwitcherItems = operatingGate?.isBlocked
           ? resolvedApps.map((app) =>
-              app.id === "hub" || app.id === "anima"
+              app.id === "shell" || app.id === "anima"
                 ? { ...app, access: app.status === "soon" ? "soon" : "enabled" }
                 : { ...app, access: app.status === "soon" ? "soon" : "disabled" }
             )
@@ -961,7 +875,3 @@ export async function VentoShell({ children }: { children: React.ReactNode }) {
     </VentoChrome>
   );
 }
-
-
-
-
