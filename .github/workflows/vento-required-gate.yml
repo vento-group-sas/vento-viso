@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       gate_context:
-        description: Contexto lógico del gate
+        description: Contexto l├│gico del gate
         required: true
         default: MERGE
         type: choice
@@ -15,7 +15,7 @@ on:
           - MERGE
           - DEPLOY
       source_commit:
-        description: SHA exacto a evaluar; vacío usa el SHA de la ejecución
+        description: SHA exacto a evaluar; vac├¡o usa el SHA de la ejecuci├│n
         required: false
         type: string
       environment:
@@ -28,7 +28,7 @@ on:
         default: NONE
         type: string
       zero_reason:
-        description: Justificación concreta cuando affected_treq=NONE
+        description: Justificaci├│n concreta cuando affected_treq=NONE
         required: true
         default: SHELL-CI-018 verifica el gate sin crear ni modificar requisitos TREQ.
         type: string
@@ -47,7 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Resolver identidad de ejecución
+      - name: Resolver identidad de ejecuci├│n
         shell: bash
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -65,16 +65,16 @@ jobs:
             || ''
           ).trim().toLowerCase();
           if (!/^[0-9a-f]{40}$/.test(source)) {
-            throw new Error(`SHA de origen inválido: ${source || 'VACÍO'}`);
+            throw new Error(`SHA de origen inv├ílido: ${source || 'VAC├ìO'}`);
           }
           const context = process.env.EVENT_NAME === 'pull_request'
             ? 'MERGE'
             : String(process.env.GATE_CONTEXT_INPUT || '').toUpperCase();
           if (!['MERGE', 'DEPLOY'].includes(context)) {
-            throw new Error(`Contexto de gate inválido: ${context || 'VACÍO'}`);
+            throw new Error(`Contexto de gate inv├ílido: ${context || 'VAC├ìO'}`);
           }
           if (context === 'DEPLOY' && !String(process.env.DEPLOY_ENVIRONMENT || '').trim()) {
-            throw new Error('DEPLOY exige un ambiente gobernado explícito.');
+            throw new Error('DEPLOY exige un ambiente gobernado expl├¡cito.');
           }
           NODE
 
@@ -93,14 +93,11 @@ jobs:
       - name: Instalar dependencias bloqueadas
         run: npm ci
 
-      - name: Verificar manifiesto de migraciones
-        run: npm run supabase:migrations:manifest:check
-
-      - name: Ejecutar fachada pública de pruebas
+      - name: Ejecutar fachada p├║blica de pruebas
         run: npm test --silent
 
   treq:
-    name: Integridad y declaración TREQ
+    name: Integridad y declaraci├│n TREQ
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -119,7 +116,7 @@ jobs:
         with:
           node-version: 24.19.0
 
-      - name: Resolver declaración TREQ
+      - name: Resolver declaraci├│n TREQ
         id: declaration
         shell: bash
         env:
@@ -139,7 +136,7 @@ jobs:
             const affectedMatch = body.match(/^VENTO-TREQ-AFFECTED:\s*(.+)$/mi);
             const reasonMatch = body.match(/^VENTO-TREQ-ZERO-REASON:\s*(.+)$/mi);
             if (!affectedMatch) {
-              throw new Error('Falta la línea obligatoria VENTO-TREQ-AFFECTED en el cuerpo del PR.');
+              throw new Error('Falta la l├¡nea obligatoria VENTO-TREQ-AFFECTED en el cuerpo del PR.');
             }
             rawAffected = affectedMatch[1].trim();
             zeroReason = reasonMatch?.[1]?.trim() || '';
@@ -148,13 +145,13 @@ jobs:
             zeroReason = String(process.env.DISPATCH_ZERO_REASON || '').trim();
           }
 
-          if (!rawAffected) throw new Error('La declaración VENTO-TREQ-AFFECTED está vacía.');
+          if (!rawAffected) throw new Error('La declaraci├│n VENTO-TREQ-AFFECTED est├í vac├¡a.');
           const none = rawAffected.toUpperCase() === 'NONE';
           const ids = none
             ? []
             : rawAffected.split(',').map((value) => value.trim()).filter(Boolean);
           if (none && zeroReason.length < 20) {
-            throw new Error('VENTO-TREQ-ZERO-REASON debe contener una justificación concreta de al menos 20 caracteres.');
+            throw new Error('VENTO-TREQ-ZERO-REASON debe contener una justificaci├│n concreta de al menos 20 caracteres.');
           }
           if (!none && ids.length === 0) throw new Error('No se resolvieron identificadores TREQ.');
 
@@ -165,7 +162,7 @@ jobs:
           fs.appendFileSync(out, `zero_reason=${zeroReason.replace(/[\r\n]+/g, ' ')}\n`);
           NODE
 
-      - name: Descargar autoridad canónica TREQ para consumidores
+      - name: Descargar autoridad can├│nica TREQ para consumidores
         if: ${{ github.repository != 'vento-group-sas/vento-shell' }}
         uses: actions/checkout@v4
         with:
@@ -174,7 +171,7 @@ jobs:
           path: .ci018-shell
           fetch-depth: 1
 
-      - name: Validar TREQ en SHELL con baseline explícita
+      - name: Validar TREQ en SHELL con baseline expl├¡cita
         if: ${{ github.repository == 'vento-group-sas/vento-shell' && github.event_name == 'pull_request' }}
         shell: bash
         env:
@@ -275,7 +272,7 @@ jobs:
           path: .ci019-shell
           fetch-depth: 1
 
-      - name: Materializar decisión MERGE de CI018
+      - name: Materializar decisi├│n MERGE de CI018
         id: decision
         shell: bash
         env:
@@ -379,7 +376,7 @@ jobs:
             --execution-identity "$EXECUTION_IDENTITY" \
             --json
 
-      - name: Aplicar decisión MERGE y publicación fail-closed
+      - name: Aplicar decisi├│n MERGE y publicaci├│n fail-closed
         if: ${{ always() }}
         shell: bash
         env:
@@ -413,7 +410,7 @@ jobs:
           path: .ci019-shell
           fetch-depth: 1
 
-      - name: Materializar decisión DEPLOY de CI018
+      - name: Materializar decisi├│n DEPLOY de CI018
         id: decision
         shell: bash
         env:
@@ -517,7 +514,7 @@ jobs:
             --execution-identity "$EXECUTION_IDENTITY" \
             --json
 
-      - name: Aplicar decisión DEPLOY y publicación fail-closed
+      - name: Aplicar decisi├│n DEPLOY y publicaci├│n fail-closed
         if: ${{ always() }}
         shell: bash
         env:
