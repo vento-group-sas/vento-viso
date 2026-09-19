@@ -1,0 +1,537 @@
+name: VENTO Required Gate
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+  workflow_dispatch:
+    inputs:
+      gate_context:
+        description: Contexto lógico del gate
+        required: true
+        default: MERGE
+        type: choice
+        options:
+          - MERGE
+          - DEPLOY
+      source_commit:
+        description: SHA exacto a evaluar; vacío usa el SHA de la ejecución
+        required: false
+        type: string
+      environment:
+        description: Ambiente gobernado; obligatorio para DEPLOY
+        required: false
+        type: string
+      affected_treq:
+        description: IDs TREQ separados por coma o NONE
+        required: true
+        default: NONE
+        type: string
+      zero_reason:
+        description: Justificación concreta cuando affected_treq=NONE
+        required: true
+        default: SHELL-CI-018 verifica el gate sin crear ni modificar requisitos TREQ.
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CI: "1"
+  FORCE_COLOR: "0"
+  NO_COLOR: "1"
+
+jobs:
+  tests:
+    name: Pruebas obligatorias del repositorio
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Resolver identidad de ejecución
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DISPATCH_SHA: ${{ inputs.source_commit }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          GATE_CONTEXT_INPUT: ${{ inputs.gate_context }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+        run: |
+          node <<'NODE'
+          const source = (
+            process.env.PR_HEAD_SHA
+            || process.env.DISPATCH_SHA
+            || process.env.GITHUB_SHA_VALUE
+            || ''
+          ).trim().toLowerCase();
+          if (!/^[0-9a-f]{40}$/.test(source)) {
+            throw new Error(`SHA de origen inválido: ${source || 'VACÍO'}`);
+          }
+          const context = process.env.EVENT_NAME === 'pull_request'
+            ? 'MERGE'
+            : String(process.env.GATE_CONTEXT_INPUT || '').toUpperCase();
+          if (!['MERGE', 'DEPLOY'].includes(context)) {
+            throw new Error(`Contexto de gate inválido: ${context || 'VACÍO'}`);
+          }
+          if (context === 'DEPLOY' && !String(process.env.DEPLOY_ENVIRONMENT || '').trim()) {
+            throw new Error('DEPLOY exige un ambiente gobernado explícito.');
+          }
+          NODE
+
+      - name: Descargar commit exacto
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.source_commit || github.sha }}
+          fetch-depth: 0
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: npm
+
+      - name: Instalar dependencias bloqueadas
+        run: npm ci
+
+      - name: Verificar manifiesto de migraciones
+        run: npm run supabase:migrations:manifest:check
+
+      - name: Ejecutar fachada pública de pruebas
+        run: npm test --silent
+
+  treq:
+    name: Integridad y declaración TREQ
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      affected_json: ${{ steps.declaration.outputs.affected_json }}
+      registry_identity: ${{ steps.registry.outputs.registry_identity }}
+      baseline_identity: ${{ steps.registry.outputs.baseline_identity }}
+    steps:
+      - name: Descargar commit exacto
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || inputs.source_commit || github.sha }}
+          fetch-depth: 0
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+
+      - name: Resolver declaración TREQ
+        id: declaration
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+          DISPATCH_AFFECTED: ${{ inputs.affected_treq }}
+          DISPATCH_ZERO_REASON: ${{ inputs.zero_reason }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const event = JSON.parse(fs.readFileSync(process.env.EVENT_PATH, 'utf8'));
+          let rawAffected = '';
+          let zeroReason = '';
+
+          if (process.env.EVENT_NAME === 'pull_request') {
+            const body = String(event.pull_request?.body || '');
+            const affectedMatch = body.match(/^VENTO-TREQ-AFFECTED:\s*(.+)$/mi);
+            const reasonMatch = body.match(/^VENTO-TREQ-ZERO-REASON:\s*(.+)$/mi);
+            if (!affectedMatch) {
+              throw new Error('Falta la línea obligatoria VENTO-TREQ-AFFECTED en el cuerpo del PR.');
+            }
+            rawAffected = affectedMatch[1].trim();
+            zeroReason = reasonMatch?.[1]?.trim() || '';
+          } else {
+            rawAffected = String(process.env.DISPATCH_AFFECTED || '').trim();
+            zeroReason = String(process.env.DISPATCH_ZERO_REASON || '').trim();
+          }
+
+          if (!rawAffected) throw new Error('La declaración VENTO-TREQ-AFFECTED está vacía.');
+          const none = rawAffected.toUpperCase() === 'NONE';
+          const ids = none
+            ? []
+            : rawAffected.split(',').map((value) => value.trim()).filter(Boolean);
+          if (none && zeroReason.length < 20) {
+            throw new Error('VENTO-TREQ-ZERO-REASON debe contener una justificación concreta de al menos 20 caracteres.');
+          }
+          if (!none && ids.length === 0) throw new Error('No se resolvieron identificadores TREQ.');
+
+          const out = process.env.GITHUB_OUTPUT;
+          fs.appendFileSync(out, `affected=${ids.join(',')}\n`);
+          fs.appendFileSync(out, `affected_json=${JSON.stringify(ids)}\n`);
+          fs.appendFileSync(out, `allow_zero=${none ? 'true' : 'false'}\n`);
+          fs.appendFileSync(out, `zero_reason=${zeroReason.replace(/[\r\n]+/g, ' ')}\n`);
+          NODE
+
+      - name: Descargar autoridad canónica TREQ para consumidores
+        if: ${{ github.repository != 'vento-group-sas/vento-shell' }}
+        uses: actions/checkout@v4
+        with:
+          repository: vento-group-sas/vento-shell
+          ref: main
+          path: .ci018-shell
+          fetch-depth: 1
+
+      - name: Validar TREQ en SHELL con baseline explícita
+        if: ${{ github.repository == 'vento-group-sas/vento-shell' && github.event_name == 'pull_request' }}
+        shell: bash
+        env:
+          AFFECTED: ${{ steps.declaration.outputs.affected }}
+          ALLOW_ZERO: ${{ steps.declaration.outputs.allow_zero }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          BASE_ROOT="$RUNNER_TEMP/ci018-base"
+          BASELINE_FILE="$RUNNER_TEMP/ci018-treq-baseline.md"
+          git worktree add --detach "$BASE_ROOT" "$BASE_SHA"
+          BASE_ROOT="$BASE_ROOT" BASELINE_FILE="$BASELINE_FILE" node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const modulePath = path.join(process.env.BASE_ROOT, 'scripts/docs/treq-registry-files.mjs');
+          const registry = await import(pathToFileURL(modulePath).href);
+          const bundle = registry.readCanonicalTreqRegistryBundle({
+            baseDir: path.join(process.env.BASE_ROOT, 'docs/plan-canonico/modular'),
+          });
+          fs.writeFileSync(process.env.BASELINE_FILE, bundle.source, 'utf8');
+          NODE
+          if [ "$ALLOW_ZERO" = "true" ]; then
+            node scripts/docs/validate-treq-registry.mjs --json --baseline-file "$BASELINE_FILE" --require-baseline --affected "" --allow-zero-affected
+          else
+            node scripts/docs/validate-treq-registry.mjs --json --baseline-file "$BASELINE_FILE" --require-baseline --affected "$AFFECTED"
+          fi
+
+      - name: Validar TREQ en SHELL fuera de PR
+        if: ${{ github.repository == 'vento-group-sas/vento-shell' && github.event_name != 'pull_request' }}
+        shell: bash
+        env:
+          AFFECTED: ${{ steps.declaration.outputs.affected }}
+          ALLOW_ZERO: ${{ steps.declaration.outputs.allow_zero }}
+        run: |
+          if [ "$ALLOW_ZERO" = "true" ]; then
+            node scripts/docs/validate-treq-registry.mjs --json --affected "" --allow-zero-affected
+          else
+            node scripts/docs/validate-treq-registry.mjs --json --affected "$AFFECTED"
+          fi
+
+      - name: Validar TREQ en consumidor
+        if: ${{ github.repository != 'vento-group-sas/vento-shell' }}
+        shell: bash
+        env:
+          AFFECTED: ${{ steps.declaration.outputs.affected }}
+          ALLOW_ZERO: ${{ steps.declaration.outputs.allow_zero }}
+        run: |
+          cd .ci018-shell
+          if [ "$ALLOW_ZERO" = "true" ]; then
+            node scripts/docs/validate-treq-registry.mjs --json --affected "" --allow-zero-affected
+          else
+            node scripts/docs/validate-treq-registry.mjs --json --affected "$AFFECTED"
+          fi
+
+      - name: Calcular identidades TREQ
+        id: registry
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { createHash } from 'node:crypto';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+
+          const root = process.env.REPOSITORY === 'vento-group-sas/vento-shell'
+            ? process.cwd()
+            : path.join(process.cwd(), '.ci018-shell');
+          const modulePath = path.join(root, 'scripts/docs/treq-registry-files.mjs');
+          const registry = await import(pathToFileURL(modulePath).href);
+          const bundle = registry.readCanonicalTreqRegistryBundle({
+            baseDir: path.join(root, 'docs/plan-canonico/modular'),
+          });
+          const identity = `sha256:${createHash('sha256').update(bundle.source, 'utf8').digest('hex')}`;
+          const baseline = process.env.REPOSITORY === 'vento-group-sas/vento-shell'
+            && process.env.EVENT_NAME === 'pull_request'
+            ? String(process.env.BASE_SHA || '')
+            : '';
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `registry_identity=${identity}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `baseline_identity=${baseline}\n`);
+          NODE
+
+  merge_gate:
+    name: VENTO Required Gate
+    if: ${{ always() && (github.event_name == 'pull_request' || inputs.gate_context == 'MERGE') }}
+    needs: [tests, treq]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Descargar motor propietario CI019
+        uses: actions/checkout@v4
+        with:
+          repository: vento-group-sas/vento-shell
+          ref: main
+          path: .ci019-shell
+          fetch-depth: 1
+
+      - name: Materializar decisión MERGE de CI018
+        id: decision
+        shell: bash
+        env:
+          TEST_RESULT: ${{ needs.tests.result }}
+          TREQ_RESULT: ${{ needs.treq.result }}
+          AFFECTED_JSON: ${{ needs.treq.outputs.affected_json }}
+          TREQ_REGISTRY_IDENTITY: ${{ needs.treq.outputs.registry_identity }}
+          TREQ_BASELINE_IDENTITY: ${{ needs.treq.outputs.baseline_identity }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || inputs.source_commit || github.sha }}
+          BASE_COMMIT: ${{ github.event.pull_request.base.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPORT_PATH: ${{ runner.temp }}/vento-ci019/gate-decision.json
+        run: |
+          mkdir -p "$(dirname "$REPORT_PATH")"
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const checks = [
+            { check_id: 'npm-test', owner: 'SHELL-CI-016', result: process.env.TEST_RESULT === 'success' ? 'PASS' : 'FAIL' },
+            { check_id: 'treq-registry', owner: 'SHELL-CI-017', result: process.env.TREQ_RESULT === 'success' ? 'PASS' : 'FAIL' },
+          ];
+          const failures = checks.filter((check) => check.result !== 'PASS').map((check) => check.check_id);
+          const requiredIdentity = `sha256:${crypto.createHash('sha256').update(JSON.stringify(checks.map(({ check_id, owner }) => ({ check_id, owner })))).digest('hex')}`;
+          const now = new Date().toISOString();
+          const report = {
+            schema_version: 1,
+            logical_gate_identity: 'VENTO Required Gate',
+            gate_context: 'MERGE',
+            repository: process.env.REPOSITORY,
+            source_commit: process.env.SOURCE_COMMIT,
+            base_commit: process.env.BASE_COMMIT || null,
+            target_branch: 'main',
+            environment: null,
+            package_id: null,
+            required_check_set_identity: requiredIdentity,
+            checks,
+            treq_registry_identity: process.env.TREQ_REGISTRY_IDENTITY || null,
+            treq_baseline_identity: process.env.TREQ_BASELINE_IDENTITY || null,
+            affected_treq_ids: JSON.parse(process.env.AFFECTED_JSON || '[]'),
+            started_at: now,
+            completed_at: now,
+            execution_identity: `github:${process.env.RUN_ID}:${process.env.RUN_ATTEMPT}`,
+            result: failures.length === 0 ? 'PASS' : 'FAIL',
+            block_reasons: failures,
+          };
+          fs.writeFileSync(process.env.REPORT_PATH, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `gate_result=${report.result}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `execution_identity=${report.execution_identity}\n`);
+          console.log(JSON.stringify(report, null, 2));
+          NODE
+
+      - name: Construir bundle CI019
+        id: evidence
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_IDENTITY: ${{ github.workflow_ref }}
+          REPORT_PATH: ${{ runner.temp }}/vento-ci019/gate-decision.json
+          OUTPUT_DIR: ${{ runner.temp }}/vento-ci019/evidence
+        run: |
+          node .ci019-shell/scripts/quality/test-evidence-publisher.mjs build-bundle \
+            --gate-report "$REPORT_PATH" \
+            --output-dir "$OUTPUT_DIR" \
+            --repository "$REPOSITORY" \
+            --provider github-actions \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --workflow "$WORKFLOW_IDENTITY" \
+            --github-output "$GITHUB_OUTPUT" \
+            --json
+
+      - name: Publicar bundle CI019
+        id: publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.evidence.outputs.artifact_name }}
+          path: ${{ runner.temp }}/vento-ci019/evidence
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Verificar identidad local del bundle publicado
+        if: ${{ always() }}
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || inputs.source_commit || github.sha }}
+          EXECUTION_IDENTITY: ${{ steps.decision.outputs.execution_identity }}
+          REPORT_PATH: ${{ runner.temp }}/vento-ci019/evidence/gate-decision.json
+          BUNDLE_PATH: ${{ runner.temp }}/vento-ci019/evidence/bundle.json
+        run: |
+          node .ci019-shell/scripts/quality/test-evidence-publisher.mjs verify-bundle \
+            --bundle "$BUNDLE_PATH" \
+            --gate-report "$REPORT_PATH" \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --execution-identity "$EXECUTION_IDENTITY" \
+            --json
+
+      - name: Aplicar decisión MERGE y publicación fail-closed
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GATE_RESULT: ${{ steps.decision.outputs.gate_result }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          node <<'NODE'
+          const gateResult = String(process.env.GATE_RESULT || '');
+          const publication = String(process.env.PUBLISH_OUTCOME || '');
+          if (publication !== 'success') {
+            throw new Error(`CI019 publication=${publication || 'missing'}; VENTO Required Gate=DENY`);
+          }
+          if (gateResult !== 'PASS') {
+            throw new Error(`CI018 decision=${gateResult || 'missing'}; VENTO Required Gate=DENY`);
+          }
+          console.log('VENTO Required Gate=PASS; CI019 publication=PASS');
+          NODE
+
+  deploy_gate:
+    name: VENTO Deploy Gate
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.gate_context == 'DEPLOY' }}
+    needs: [tests, treq]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Descargar motor propietario CI019
+        uses: actions/checkout@v4
+        with:
+          repository: vento-group-sas/vento-shell
+          ref: main
+          path: .ci019-shell
+          fetch-depth: 1
+
+      - name: Materializar decisión DEPLOY de CI018
+        id: decision
+        shell: bash
+        env:
+          TEST_RESULT: ${{ needs.tests.result }}
+          TREQ_RESULT: ${{ needs.treq.result }}
+          AFFECTED_JSON: ${{ needs.treq.outputs.affected_json }}
+          TREQ_REGISTRY_IDENTITY: ${{ needs.treq.outputs.registry_identity }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
+          DEPLOY_ENVIRONMENT: ${{ inputs.environment }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          REPORT_PATH: ${{ runner.temp }}/vento-ci019/gate-decision.json
+        run: |
+          mkdir -p "$(dirname "$REPORT_PATH")"
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const checks = [
+            { check_id: 'npm-test', owner: 'SHELL-CI-016', result: process.env.TEST_RESULT === 'success' ? 'PASS' : 'FAIL' },
+            { check_id: 'treq-registry', owner: 'SHELL-CI-017', result: process.env.TREQ_RESULT === 'success' ? 'PASS' : 'FAIL' },
+          ];
+          const failures = checks.filter((check) => check.result !== 'PASS').map((check) => check.check_id);
+          const requiredIdentity = `sha256:${crypto.createHash('sha256').update(JSON.stringify(checks.map(({ check_id, owner }) => ({ check_id, owner })))).digest('hex')}`;
+          const now = new Date().toISOString();
+          const report = {
+            schema_version: 1,
+            logical_gate_identity: 'VENTO Required Gate',
+            technical_check_identity: 'VENTO Deploy Gate',
+            gate_context: 'DEPLOY',
+            repository: process.env.REPOSITORY,
+            source_commit: process.env.SOURCE_COMMIT,
+            base_commit: null,
+            target_branch: 'main',
+            environment: process.env.DEPLOY_ENVIRONMENT,
+            package_id: null,
+            required_check_set_identity: requiredIdentity,
+            checks,
+            treq_registry_identity: process.env.TREQ_REGISTRY_IDENTITY || null,
+            treq_baseline_identity: null,
+            affected_treq_ids: JSON.parse(process.env.AFFECTED_JSON || '[]'),
+            started_at: now,
+            completed_at: now,
+            execution_identity: `github:${process.env.RUN_ID}:${process.env.RUN_ATTEMPT}`,
+            result: failures.length === 0 ? 'PASS' : 'FAIL',
+            block_reasons: failures,
+          };
+          fs.writeFileSync(process.env.REPORT_PATH, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `gate_result=${report.result}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `execution_identity=${report.execution_identity}\n`);
+          console.log(JSON.stringify(report, null, 2));
+          NODE
+
+      - name: Construir bundle CI019
+        id: evidence
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_IDENTITY: ${{ github.workflow_ref }}
+          REPORT_PATH: ${{ runner.temp }}/vento-ci019/gate-decision.json
+          OUTPUT_DIR: ${{ runner.temp }}/vento-ci019/evidence
+        run: |
+          node .ci019-shell/scripts/quality/test-evidence-publisher.mjs build-bundle \
+            --gate-report "$REPORT_PATH" \
+            --output-dir "$OUTPUT_DIR" \
+            --repository "$REPOSITORY" \
+            --provider github-actions \
+            --run-id "$RUN_ID" \
+            --run-attempt "$RUN_ATTEMPT" \
+            --workflow "$WORKFLOW_IDENTITY" \
+            --github-output "$GITHUB_OUTPUT" \
+            --json
+
+      - name: Publicar bundle CI019
+        id: publish
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.evidence.outputs.artifact_name }}
+          path: ${{ runner.temp }}/vento-ci019/evidence
+          if-no-files-found: error
+          overwrite: false
+          include-hidden-files: false
+
+      - name: Verificar identidad local del bundle publicado
+        if: ${{ always() }}
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_COMMIT: ${{ inputs.source_commit || github.sha }}
+          EXECUTION_IDENTITY: ${{ steps.decision.outputs.execution_identity }}
+          REPORT_PATH: ${{ runner.temp }}/vento-ci019/evidence/gate-decision.json
+          BUNDLE_PATH: ${{ runner.temp }}/vento-ci019/evidence/bundle.json
+        run: |
+          node .ci019-shell/scripts/quality/test-evidence-publisher.mjs verify-bundle \
+            --bundle "$BUNDLE_PATH" \
+            --gate-report "$REPORT_PATH" \
+            --repository "$REPOSITORY" \
+            --source-commit "$SOURCE_COMMIT" \
+            --execution-identity "$EXECUTION_IDENTITY" \
+            --json
+
+      - name: Aplicar decisión DEPLOY y publicación fail-closed
+        if: ${{ always() }}
+        shell: bash
+        env:
+          GATE_RESULT: ${{ steps.decision.outputs.gate_result }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+        run: |
+          node <<'NODE'
+          const gateResult = String(process.env.GATE_RESULT || '');
+          const publication = String(process.env.PUBLISH_OUTCOME || '');
+          if (publication !== 'success') {
+            throw new Error(`CI019 publication=${publication || 'missing'}; VENTO Deploy Gate=DENY`);
+          }
+          if (gateResult !== 'PASS') {
+            throw new Error(`CI018 decision=${gateResult || 'missing'}; VENTO Deploy Gate=DENY`);
+          }
+          console.log('VENTO Deploy Gate=PASS; CI019 publication=PASS');
+          NODE
