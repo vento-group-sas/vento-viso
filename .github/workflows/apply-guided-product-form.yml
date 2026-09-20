@@ -1,30 +1,26 @@
-name: Apply guided commercial product form
+name: Validate guided commercial product form
 
 on:
-  push:
-    branches:
-      - main
+  pull_request:
+    branches: [main]
     paths:
       - scripts/patch-guided-product-form.py
+      - src/components/viso/menu-item-form.tsx
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  apply:
+  validate-generated-form:
+    name: Validate generated commercial product form
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-      - name: Apply patch
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Apply generator in runner only
         run: python scripts/patch-guided-product-form.py
-      - name: Commit result
-        run: |
-          git config user.name "vento-viso-bot"
-          git config user.email "viso-bot@ventogroup.co"
-          git add src/components/viso/menu-item-form.tsx
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m "feat(menu): simplify commercial product creation flow"
-          git push origin HEAD:main
+
+      - name: Verify generated file is already committed
+        run: git diff --exit-code -- src/components/viso/menu-item-form.tsx
