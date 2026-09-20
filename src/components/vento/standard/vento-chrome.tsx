@@ -1,4 +1,4 @@
-﻿"use client";
+"use client";
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -71,17 +71,11 @@ type VentoChromeProps = {
   navGroups: NavGroup[];
 };
 
+type CanonicalAppCode = "shell" | "anima" | "viso" | "nexo" | "fogo" | "origo" | "pulso" | "numera" | "aura" | "pass";
+type LocalAppEntity = "default" | Exclude<CanonicalAppCode, "shell" | "pass">;
+
 const APP_ENTITY =
-  (process.env.NEXT_PUBLIC_VENTO_ENTITY?.toLowerCase() as
-    | "default"
-    | "nexo"
-    | "fogo"
-    | "pulso"
-    | "viso"
-    | "origo"
-    | "numera"
-    | "anima"
-    | "aura") ?? "viso";
+  (process.env.NEXT_PUBLIC_VENTO_ENTITY?.toLowerCase() as LocalAppEntity) ?? "viso";
 
 const APP_NAME = process.env.NEXT_PUBLIC_VENTO_APP_NAME ?? "VISO";
 
