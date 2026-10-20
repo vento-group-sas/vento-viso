@@ -106,9 +106,9 @@ export function AttendanceReportPanel({
   }, [employeeOptions, siteId]);
 
   useEffect(() => {
-    if (!employeeId) return;
-    if (filteredEmployees.some((employee) => employee.id === employeeId)) return;
-    setEmployeeId("");
+    if (!employeeId || filteredEmployees.some((employee) => employee.id === employeeId)) return;
+    const frame = window.requestAnimationFrame(() => setEmployeeId(""));
+    return () => window.cancelAnimationFrame(frame);
   }, [employeeId, filteredEmployees]);
 
   const buildReportUrl = useCallback(
@@ -151,7 +151,10 @@ export function AttendanceReportPanel({
   }, [buildReportUrl, canViewReports]);
 
   useEffect(() => {
-    void loadSummary();
+    const frame = window.requestAnimationFrame(() => {
+      void loadSummary();
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [loadSummary]);
 
   const handleDownload = useCallback(() => {

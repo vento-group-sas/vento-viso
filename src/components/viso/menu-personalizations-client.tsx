@@ -672,42 +672,48 @@ export function MenuPersonalizationsClient({
   }, [sharedTemplateAssignments]);
 
   useEffect(() => {
-    setNewSharedTemplateDraft((current) => {
-      const defaultName = currentDisplayGroup ? `${currentDisplayGroup} base` : "";
-      const allGroupIds = visibleOptionGroups.map((group) => group.id);
-      const allVariantIds = visualVariants.map((variant) => variant.id);
-      const currentGroupIds = current.groupIds.filter((id) => allGroupIds.includes(id));
-      const currentVariantIds = current.variantIds.filter((id) => allVariantIds.includes(id));
-
-      return {
-        name: current.name || defaultName,
-        description: current.description,
-        groupIds: currentGroupIds.length > 0
-          ? Array.from(new Set([...currentGroupIds, ...allGroupIds]))
-          : allGroupIds,
-        variantIds: currentVariantIds.length > 0 ? currentVariantIds : allVariantIds,
-        isActive: true,
-      };
+    const frame = window.requestAnimationFrame(() => {
+      setNewSharedTemplateDraft((current) => {
+        const defaultName = currentDisplayGroup ? `${currentDisplayGroup} base` : "";
+        const allGroupIds = visibleOptionGroups.map((group) => group.id);
+        const allVariantIds = visualVariants.map((variant) => variant.id);
+        const currentGroupIds = current.groupIds.filter((id) => allGroupIds.includes(id));
+        const currentVariantIds = current.variantIds.filter((id) => allVariantIds.includes(id));
+  
+        return {
+          name: current.name || defaultName,
+          description: current.description,
+          groupIds: currentGroupIds.length > 0
+            ? Array.from(new Set([...currentGroupIds, ...allGroupIds]))
+            : allGroupIds,
+          variantIds: currentVariantIds.length > 0 ? currentVariantIds : allVariantIds,
+          isActive: true,
+        };
+      });
     });
+    return () => window.cancelAnimationFrame(frame);
   }, [currentDisplayGroup, visibleOptionGroups, visualVariants]);
 
   useEffect(() => {
-    const nextDrafts: Record<string, SharedTemplateDraft> = {};
-
-    for (const template of sharedTemplates) {
-      const templateGroups = sharedTemplateGroupsByTemplate.get(template.id) ?? [];
-      const templateAssignments = sharedTemplateAssignmentsByTemplate.get(template.id) ?? [];
-
-      nextDrafts[template.id] = {
-        name: template.name,
-        description: template.description ?? "",
-        groupIds: templateGroups.filter((entry) => entry.is_active).map((entry) => entry.option_group_id),
-        variantIds: templateAssignments.filter((entry) => entry.is_active).map((entry) => entry.catalog_item_id),
-        isActive: template.is_active,
-      };
-    }
-
-    setSharedTemplateDrafts(nextDrafts);
+    const frame = window.requestAnimationFrame(() => {
+      const nextDrafts: Record<string, SharedTemplateDraft> = {};
+  
+      for (const template of sharedTemplates) {
+        const templateGroups = sharedTemplateGroupsByTemplate.get(template.id) ?? [];
+        const templateAssignments = sharedTemplateAssignmentsByTemplate.get(template.id) ?? [];
+  
+        nextDrafts[template.id] = {
+          name: template.name,
+          description: template.description ?? "",
+          groupIds: templateGroups.filter((entry) => entry.is_active).map((entry) => entry.option_group_id),
+          variantIds: templateAssignments.filter((entry) => entry.is_active).map((entry) => entry.catalog_item_id),
+          isActive: template.is_active,
+        };
+      }
+  
+      setSharedTemplateDrafts(nextDrafts);
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [sharedTemplates, sharedTemplateGroupsByTemplate, sharedTemplateAssignmentsByTemplate]);
 
   async function mutate(

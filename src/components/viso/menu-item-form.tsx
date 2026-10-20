@@ -392,50 +392,68 @@ export function MenuItemForm({
   }, [priceAmount, suggestedRecipeCost]);
 
   useEffect(() => {
-    if (mode !== "create" || !selectedProduct) return;
-    if (!name.trim()) setName(getProductDisplayName(selectedProduct));
-    if (!description.trim() && selectedProduct.description?.trim()) {
-      setDescription(selectedProduct.description.trim());
-    }
+    const frame = window.requestAnimationFrame(() => {
+      if (mode !== "create" || !selectedProduct) return;
+      if (!name.trim()) setName(getProductDisplayName(selectedProduct));
+      if (!description.trim() && selectedProduct.description?.trim()) {
+        setDescription(selectedProduct.description.trim());
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [description, mode, name, selectedProduct]);
 
   useEffect(() => {
-    if (suggestedPrice == null || priceAmount.trim()) return;
-    setPriceAmount(String(Math.round(suggestedPrice)));
+    const frame = window.requestAnimationFrame(() => {
+      if (suggestedPrice == null || priceAmount.trim()) return;
+      setPriceAmount(String(Math.round(suggestedPrice)));
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [priceAmount, suggestedPrice]);
 
   useEffect(() => {
-    const validCollectionIds = new Set(visibleCollections.map((collection) => collection.id));
-    if (primaryCollectionId && !validCollectionIds.has(primaryCollectionId)) {
-      setPrimaryCollectionId("");
-      setCommercialCategoryId("");
-      setAdditionalCollectionIds([]);
-    }
-    setAdditionalCollectionIds((current) => current.filter((id) => validCollectionIds.has(id)));
+    const frame = window.requestAnimationFrame(() => {
+      const validCollectionIds = new Set(visibleCollections.map((collection) => collection.id));
+      if (primaryCollectionId && !validCollectionIds.has(primaryCollectionId)) {
+        setPrimaryCollectionId("");
+        setCommercialCategoryId("");
+        setAdditionalCollectionIds([]);
+      }
+      setAdditionalCollectionIds((current) => current.filter((id) => validCollectionIds.has(id)));
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [primaryCollectionId, visibleCollections]);
 
   useEffect(() => {
-    if (!commercialCategoryId) return;
-    const isValid = visibleCategories.some((category) => category.id === commercialCategoryId);
-    if (!isValid) {
-      setCommercialCategoryId("");
-      setAdditionalCollectionIds([]);
-    }
+    const frame = window.requestAnimationFrame(() => {
+      if (!commercialCategoryId) return;
+      const isValid = visibleCategories.some((category) => category.id === commercialCategoryId);
+      if (!isValid) {
+        setCommercialCategoryId("");
+        setAdditionalCollectionIds([]);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [commercialCategoryId, visibleCategories]);
 
   useEffect(() => {
-    setAdditionalCollectionIds((current) =>
-      current.filter((id) => compatibleAdditionalCollections.some((collection) => collection.id === id)),
-    );
+    const frame = window.requestAnimationFrame(() => {
+      setAdditionalCollectionIds((current) =>
+        current.filter((id) => compatibleAdditionalCollections.some((collection) => collection.id === id)),
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [compatibleAdditionalCollections]);
 
   useEffect(() => {
-    if (!productId) return;
-    const stillValid = eligibleProducts.some((product) => product.id === productId);
-    if (!stillValid || selectedProductAlreadyCreated) {
-      setProductId("");
-      setProductQuery("");
-    }
+    const frame = window.requestAnimationFrame(() => {
+      if (!productId) return;
+      const stillValid = eligibleProducts.some((product) => product.id === productId);
+      if (!stillValid || selectedProductAlreadyCreated) {
+        setProductId("");
+        setProductQuery("");
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, [eligibleProducts, productId, selectedProductAlreadyCreated]);
 
   useEffect(() => {

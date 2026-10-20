@@ -19,6 +19,26 @@ type ProfileMenuProps = {
 
 const SITE_OVERRIDE_COOKIE = "viso_site_override_id";
 
+const setCookieValue = (value: string | null) => {
+  if (typeof document === "undefined") return;
+  if (!value) {
+    document.cookie = `${ROLE_OVERRIDE_COOKIE}=; path=/; max-age=0`;
+    return;
+  }
+  const maxAge = 60 * 60 * 24 * 30;
+  document.cookie = `${ROLE_OVERRIDE_COOKIE}=${value}; path=/; max-age=${maxAge}`;
+};
+
+const setSiteCookieValue = (value: string | null) => {
+  if (typeof document === "undefined") return;
+  if (!value) {
+    document.cookie = `${SITE_OVERRIDE_COOKIE}=; path=/; max-age=0`;
+    return;
+  }
+  const maxAge = 60 * 60 * 24 * 30;
+  document.cookie = `${SITE_OVERRIDE_COOKIE}=${value}; path=/; max-age=${maxAge}`;
+};
+
 function initialsFrom(value?: string) {
   const text = (value ?? "").trim();
   if (!text) return "VG";
@@ -57,26 +77,6 @@ export function ProfileMenu({ name, role, email, sites, activeSiteId: baseActive
       const returnTo = encodeURIComponent(window.location.origin);
       window.location.href = `${shellLoginUrl}?returnTo=${returnTo}`;
     }
-  };
-
-  const setCookieValue = (value: string | null) => {
-    if (typeof document === "undefined") return;
-    if (!value) {
-      document.cookie = `${ROLE_OVERRIDE_COOKIE}=; path=/; max-age=0`;
-      return;
-    }
-    const maxAge = 60 * 60 * 24 * 30;
-    document.cookie = `${ROLE_OVERRIDE_COOKIE}=${value}; path=/; max-age=${maxAge}`;
-  };
-
-  const setSiteCookieValue = (value: string | null) => {
-    if (typeof document === "undefined") return;
-    if (!value) {
-      document.cookie = `${SITE_OVERRIDE_COOKIE}=; path=/; max-age=0`;
-      return;
-    }
-    const maxAge = 60 * 60 * 24 * 30;
-    document.cookie = `${SITE_OVERRIDE_COOKIE}=${value}; path=/; max-age=${maxAge}`;
   };
 
   const handleRoleOverride = (value: string | null) => {
@@ -173,14 +173,16 @@ export function ProfileMenu({ name, role, email, sites, activeSiteId: baseActive
   }, [open]);
 
   useEffect(() => {
-    if (typeof document === "undefined") return;
-    const entry = document.cookie
-      .split("; ")
-      .find((cookie) => cookie.startsWith(`${ROLE_OVERRIDE_COOKIE}=`));
-    if (entry) {
-      const value = entry.split("=")[1] ?? "";
-      setOverrideRole(value || null);
-    }
+    const frame = window.requestAnimationFrame(() => {
+      const entry = document.cookie
+        .split("; ")
+        .find((cookie) => cookie.startsWith(`${ROLE_OVERRIDE_COOKIE}=`));
+      if (entry) {
+        const value = entry.split("=")[1] ?? "";
+        setOverrideRole(value || null);
+      }
+    });
+    return () => window.cancelAnimationFrame(frame);
   }, []);
 
   return (
