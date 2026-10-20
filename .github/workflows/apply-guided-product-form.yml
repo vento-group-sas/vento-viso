@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - scripts/patch-guided-product-form.py
+      - .github/workflows/apply-guided-product-form.yml
       - src/components/viso/menu-item-form.tsx
   workflow_dispatch:
 
@@ -13,14 +13,116 @@ permissions:
 
 jobs:
   validate-generated-form:
-    name: Validate generated commercial product form
+    name: Validate guided commercial product form
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Apply generator in runner only
-        run: python scripts/patch-guided-product-form.py
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.19.0
+          cache: npm
 
-      - name: Verify generated file is already committed
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Validate current guided form contract
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import { readFileSync } from 'node:fs';
+          import ts from 'typescript';
+
+          const file = 'src/components/viso/menu-item-form.tsx';
+          const source = readFileSync(file, 'utf8');
+
+          function verifyForm(content) {
+            const failures = [];
+            const ast = ts.createSourceFile(file, content, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+            if (ast.parseDiagnostics.length > 0) failures.push('TSX parser diagnostics');
+
+            const fieldNames = new Set();
+            let submitGuard = '';
+            const visit = (node) => {
+              if (ts.isJsxAttribute(node) && ts.isIdentifier(node.name) &&
+                  node.name.text === 'name' && node.initializer &&
+                  ts.isStringLiteral(node.initializer)) {
+                fieldNames.add(node.initializer.text);
+              }
+              if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) &&
+                  node.name.text === 'submitDisabled' && node.initializer) {
+                submitGuard = node.initializer.getText(ast);
+              }
+              ts.forEachChild(node, visit);
+            };
+            visit(ast);
+
+            const requiredFields = [
+              'site_id', 'commercial_collection_id', 'commercial_collection_ids',
+              'commercial_category_id', 'product_id', 'price_amount',
+            ];
+            for (const field of requiredFields) {
+              if (!fieldNames.has(field)) failures.push(`Missing form field: ${field}`);
+            }
+
+            const requiredGuards = [
+              '!siteId', '!primaryCollectionId', '!commercialCategoryId',
+              '!productId', '!name.trim()', 'Number(priceAmount) <= 0',
+              'selectedProductAlreadyCreated',
+            ];
+            for (const guard of requiredGuards) {
+              if (!submitGuard.includes(guard)) failures.push(`Missing submit guard: ${guard}`);
+            }
+
+            const requiredBehaviors = [
+              'selectedCollectionIds.map((collectionId)',
+              'categoryIdSetByCollection.get(collection.id)?.has(commercialCategoryId)',
+              'isProductAlreadyCreatedForSite(product.id, siteId)',
+              'action={action}',
+            ];
+            for (const behavior of requiredBehaviors) {
+              if (!content.includes(behavior)) failures.push(`Missing form behavior: ${behavior}`);
+            }
+
+            const orderedSteps = [
+              '1. Sede de venta', '2. Colecci\u00f3n principal',
+              '3. Categor\u00eda y producto', '4. Colecciones adicionales',
+              '5. Informaci\u00f3n comercial',
+            ];
+            let previousIndex = -1;
+            for (const step of orderedSteps) {
+              const index = content.indexOf(step, previousIndex + 1);
+              if (index < 0) failures.push(`Missing or out-of-order section: ${step}`);
+              else previousIndex = index;
+            }
+            return failures;
+          }
+
+          assert.deepEqual(verifyForm(source), [], 'Guided form contract failed');
+
+          // Guard against a vacuous check: simulated regressions must fail.
+          const removedField = source.replace('name="commercial_collection_ids"', 'name="removed_collection_ids"');
+          assert.notEqual(removedField, source, 'Missing negative field fixture');
+          assert.ok(verifyForm(removedField).some((item) => item.includes('commercial_collection_ids')),
+            'Missing multi-collection field was not detected');
+
+          const removedGuard = source.replace('!commercialCategoryId ||', 'commercialCategoryId ||');
+          assert.notEqual(removedGuard, source, 'Missing negative guard fixture');
+          assert.ok(verifyForm(removedGuard).some((item) => item.includes('Missing submit guard: !commercialCategoryId')),
+            'Missing category submit guard was not detected');
+
+          console.log('Guided form contract: PASS; negative controls: 2/2 detected');
+          NODE
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run consumer tests
+        run: npm test --silent
+
+      - name: Verify source remains committed
         run: git diff --exit-code -- src/components/viso/menu-item-form.tsx
