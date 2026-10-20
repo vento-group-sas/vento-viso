@@ -9,9 +9,11 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "npm run test:ci011 && npm run test:xlsx",
+    "test": "npm run test:ci011 && npm run test:xlsx && npm run test:security && npm run audit:security",
     "test:ci011": "node --test scripts/quality/viso-consumer-baseline-gate.test.mjs",
     "test:xlsx": "node --test scripts/quality/viso-exceljs-uuid-xlsx.test.mjs",
+    "test:security": "node --test scripts/quality/viso-dependency-security-gate.test.mjs",
+    "audit:security": "node scripts/quality/viso-dependency-security-gate.mjs",
     "ci011:baseline": "node scripts/quality/viso-consumer-baseline-gate.mjs --packages=@vento/contracts,@vento/os-context,@vento/supabase,@vento/ui-web --json",
     "audit:i18n": "node scripts/audit-i18n.mjs"
   },
