@@ -9,8 +9,11 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "npm run test:ci011",
+    "test": "npm run test:ci011 && npm run test:xlsx && npm run test:security && npm run audit:security",
     "test:ci011": "node --test scripts/quality/viso-consumer-baseline-gate.test.mjs",
+    "test:xlsx": "node --test scripts/quality/viso-exceljs-uuid-xlsx.test.mjs",
+    "test:security": "node --test scripts/quality/viso-dependency-security-gate.test.mjs",
+    "audit:security": "node scripts/quality/viso-dependency-security-gate.mjs",
     "ci011:baseline": "node scripts/quality/viso-consumer-baseline-gate.mjs --packages=@vento/contracts,@vento/os-context,@vento/supabase,@vento/ui-web --json",
     "audit:i18n": "node scripts/audit-i18n.mjs"
   },
@@ -20,10 +23,15 @@
     "barcode-detector-api-polyfill": "^1.0.20",
     "bwip-js": "^4.1.0",
     "exceljs": "^4.4.0",
-    "next": "^16.1.6",
+    "next": "16.4.2",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "sharp": "^0.35.2"
+    "sharp": "0.35.5"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    }
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -31,7 +39,7 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.1.1",
+    "eslint-config-next": "16.4.2",
     "tailwindcss": "^4",
     "typescript": "^5"
   }
