@@ -1680,6 +1680,18 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   const end = source.indexOf('\nexport default async function StaffDetailPage(', start);
   assert.ok(start >= 0 && end > start, 'Review action must exist on staff detail');
   const action = source.slice(start, end);
+  const helperStart = source.indexOf('async function hasIndividualAttendanceReviewSiteGrant(');
+  const helperEnd = source.indexOf('// VPROC-0008 belongs to ANIMA.', helperStart);
+  assert.ok(helperStart >= 0 && helperEnd > helperStart);
+  const helperSource = source.slice(helperStart, helperEnd);
+  assert.match(helperSource, /\.eq\("code", "attendance\.checkout_review\.decide"\)/u);
+  assert.match(helperSource, /\.eq\("code", "anima"\)/u);
+  assert.match(helperSource, /\.eq\("scope_type", "site"\)/u);
+  assert.match(helperSource, /\.eq\("scope_site_id", siteId\)/u);
+  assert.match(helperSource, /\.eq\("employee_id", actorId\)/u);
+  assert.match(helperSource, /\.eq\("is_active", true\)/u);
+  assert.match(action, /hasIndividualAttendanceReviewSiteGrant\(/u);
+  assert.match(source, /await hasIndividualAttendanceReviewSiteGrant\(\s*supabase, staffAccess\.operatorId/u);
   assert.match(action, /await requireStaffEmployeeSiteAccess\(employeeId, "workforce\.employees\.view"\)/u);
   assert.match(action, /access\.isSharedDevice \|\| access\.operatorId === employeeId/u);
   assert.match(action, /"anima\.attendance\.checkout_review\.decide"/u);
@@ -1705,6 +1717,7 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   const form = { get: (key) => values.get(key) ?? null };
   const calls = [];
   let allowed = false;
+  let hasExactSiteGrant = false;
   let ticketTitle = 'Revisión de salida sin ubicación';
   const authClient = { rpc: async (name, args) => {
     calls.push({ name, args });
@@ -1729,6 +1742,11 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
       authClient, supabase: { from: () => query },
       isSharedDevice: false, operatorId: manager, authorizedSiteId: site,
     }),
+    hasIndividualAttendanceReviewSiteGrant: async (_, actorId, siteId) => {
+      assert.equal(actorId, manager);
+      assert.equal(siteId, site);
+      return hasExactSiteGrant;
+    },
     redirect: (url) => { throw new Error('REDIRECT:' + url); },
     revalidatePath: () => {},
     Date,
@@ -1740,6 +1758,11 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   assert.deepEqual(calls.map((x) => x.name), ['has_permission'],
     'No owner mutation RPC without effective actor-site permission');
   allowed = true;
+  calls.length = 0;
+  await assert.rejects(decide(form), /Falta%20autorizaci%C3%B3n/u);
+  assert.deepEqual(calls.map((x) => x.name), ['has_permission'],
+    'GLOBAL or role-only permission must not call the owner RPC');
+  hasExactSiteGrant = true;
   ticketTitle = 'Conversación general';
   calls.length = 0;
   await assert.rejects(decide(form), /La%20solicitud/u);

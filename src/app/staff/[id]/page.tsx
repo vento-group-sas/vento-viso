@@ -1474,6 +1474,54 @@ async function deleteEmployeeShift(formData: FormData) {
   redirect(`/staff/${employeeId}?ok=shift_deleted`);
 }
 
+// A generic has_permission() may accept GLOBAL/role grants. The sensitive
+// attendance decision has a stricter SS contract: ONLY an individual,
+// effective site grant plus an active assignment can reveal its controls.
+async function hasIndividualAttendanceReviewSiteGrant(
+  supabase: ReturnType<typeof createAdminClient>,
+  actorId: string,
+  siteId: string,
+): Promise<boolean> {
+  if (!actorId || !siteId) return false;
+  const { data: app, error: appError } = await supabase
+    .from("apps")
+    .select("id")
+    .eq("code", "anima")
+    .eq("is_active", true)
+    .maybeSingle();
+  if (appError || !app) return false;
+  const { data: permission, error: permissionError } = await supabase
+    .from("app_permissions")
+    .select("id")
+    .eq("app_id", app.id)
+    .eq("code", "attendance.checkout_review.decide")
+    .eq("is_active", true)
+    .maybeSingle();
+  if (permissionError || !permission) return false;
+  const [grant, assignment] = await Promise.all([
+    supabase.from("employee_permissions")
+      .select("id")
+      .eq("employee_id", actorId)
+      .eq("permission_id", permission.id)
+      .eq("is_allowed", true)
+      .eq("scope_type", "site")
+      .eq("scope_site_id", siteId)
+      .is("scope_area_id", null)
+      .is("scope_site_type", null)
+      .is("scope_area_kind", null)
+      .limit(1)
+      .maybeSingle(),
+    supabase.from("employee_sites")
+      .select("employee_id")
+      .eq("employee_id", actorId)
+      .eq("site_id", siteId)
+      .eq("is_active", true)
+      .maybeSingle(),
+  ]);
+  return !grant.error && Boolean(grant.data) &&
+    !assignment.error && Boolean(assignment.data);
+}
+
 // VPROC-0008 belongs to ANIMA. VISO is only an authorized review
 // surface: this action uses the signed-in actor, never service_role,
 // for the owner RPC. No direct attendance mutation is permitted here.
@@ -1508,7 +1556,10 @@ async function decideAttendanceCheckoutReview(formData: FormData) {
       p_area_id: null,
     }
   );
-  if (permissionError || canDecide !== true) {
+  if (permissionError || canDecide !== true ||
+      !(await hasIndividualAttendanceReviewSiteGrant(
+        access.supabase, access.operatorId, access.authorizedSiteId
+      ))) {
     fail("Falta autorización expresa para revisar salidas de esta sede.");
   }
   const { data: ticket, error: ticketError } = await access.supabase
@@ -1729,7 +1780,10 @@ export default async function StaffDetailPage({
     }
   );
   const canDecideAttendanceReview = reviewerGrant === true && !reviewerGrantError &&
-    !staffAccess.isSharedDevice && staffAccess.operatorId !== id;
+    !staffAccess.isSharedDevice && staffAccess.operatorId !== id &&
+    await hasIndividualAttendanceReviewSiteGrant(
+      supabase, staffAccess.operatorId, authorizedSiteId
+    );
   // Read site-scoped ANIMA requests only after an effective decision grant.
   const { data: reviewTicketsData, error: reviewTicketsError } = canDecideAttendanceReview
     ? await supabase
