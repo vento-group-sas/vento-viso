@@ -1685,6 +1685,8 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   assert.match(action, /"anima\.attendance\.checkout_review\.decide"/u);
   assert.match(action, /access\.authClient\.rpc\("decide_attendance_checkout_review_v1"/u);
   assert.match(action, /ticket\.target_employee_id \?\? ticket\.created_by/u);
+  assert.match(action, /ticket\.title !== "Revisión de salida sin ubicación"/u);
+  assert.match(source, /\.eq\("title", "Revisión de salida sin ubicación"\)/u);
   assert.match(action, /access\.authorizedSiteId/u);
   assert.match(action, /checkoutAt = instant\.toISOString\(\)/u);
   assert.doesNotMatch(action, /from\("attendance_logs"\)\.(?:insert|update|delete)|supabaseServiceRoleKey/iu);
@@ -1703,6 +1705,7 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   const form = { get: (key) => values.get(key) ?? null };
   const calls = [];
   let allowed = false;
+  let ticketTitle = 'Revisión de salida sin ubicación';
   const authClient = { rpc: async (name, args) => {
     calls.push({ name, args });
     if (name === 'has_permission') return { data: allowed, error: null };
@@ -1716,7 +1719,8 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
     eq() { return this; },
     async maybeSingle() {
       return { data: { id: ticket, site_id: site, category: 'attendance',
-        created_by: worker, target_employee_id: null, status: 'open' }, error: null };
+        title: ticketTitle, created_by: worker,
+        target_employee_id: null, status: 'open' }, error: null };
     },
   };
   const sandbox = {
@@ -1736,6 +1740,12 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   assert.deepEqual(calls.map((x) => x.name), ['has_permission'],
     'No owner mutation RPC without effective actor-site permission');
   allowed = true;
+  ticketTitle = 'Conversación general';
+  calls.length = 0;
+  await assert.rejects(decide(form), /La%20solicitud/u);
+  assert.deepEqual(calls.map((x) => x.name), ['has_permission'],
+    'A generic support ticket cannot invoke ANIMA attendance');
+  ticketTitle = 'Revisión de salida sin ubicación';
   calls.length = 0;
   await assert.rejects(decide(form), /attendance_review_rejected/u);
   assert.deepEqual(calls.map((x) => x.name),

@@ -1513,12 +1513,13 @@ async function decideAttendanceCheckoutReview(formData: FormData) {
   }
   const { data: ticket, error: ticketError } = await access.supabase
     .from("support_tickets")
-    .select("id,site_id,category,status,created_by,target_employee_id")
+    .select("id,site_id,category,title,status,created_by,target_employee_id")
     .eq("id", ticketId)
     .eq("site_id", access.authorizedSiteId)
     .eq("category", "attendance")
     .maybeSingle();
-  if (ticketError || !ticket || (ticket.target_employee_id ?? ticket.created_by) !== employeeId
+  if (ticketError || !ticket || ticket.title !== "Revisión de salida sin ubicación"
+      || (ticket.target_employee_id ?? ticket.created_by) !== employeeId
       || !["open", "in_progress"].includes(ticket.status)) {
     fail("La solicitud ya no está disponible en esta sede.");
   }
@@ -1735,6 +1736,7 @@ export default async function StaffDetailPage({
       .from("support_tickets")
       .select("id,title,description,status,site_id,created_by,target_employee_id")
       .eq("category", "attendance")
+      .eq("title", "Revisión de salida sin ubicación")
       .eq("site_id", authorizedSiteId)
       .in("status", ["open", "in_progress"])
       .or("target_employee_id.eq." + id +
