@@ -63,7 +63,18 @@ type AttendanceLogRow = {
   source: string | null;
   accuracy_meters: number | null;
   site_id: string | null;
+  shift_id: string | null;
   site?: { id: string; name: string | null; code: string | null } | { id: string; name: string | null; code: string | null }[] | null;
+};
+
+type AttendanceReviewTicketRow = {
+  id: string;
+  title: string;
+  description: string | null;
+  status: "open" | "in_progress";
+  site_id: string | null;
+  created_by: string;
+  target_employee_id: string | null;
 };
 
 type ShiftRow = {
@@ -1463,6 +1474,85 @@ async function deleteEmployeeShift(formData: FormData) {
   redirect(`/staff/${employeeId}?ok=shift_deleted`);
 }
 
+// VPROC-0008 belongs to ANIMA. VISO is only an authorized review
+// surface: this action uses the signed-in actor, never service_role,
+// for the owner RPC. No direct attendance mutation is permitted here.
+async function decideAttendanceCheckoutReview(formData: FormData) {
+  "use server";
+  const employeeId = asText(formData.get("employee_id"));
+  const ticketId = asText(formData.get("ticket_id"));
+  const checkInId = asText(formData.get("check_in_log_id"));
+  const decision = asText(formData.get("decision"));
+  const reason = asText(formData.get("reason"));
+  const localTime = asText(formData.get("checkout_local"));
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value);
+  if (![employeeId, ticketId, checkInId].every(isUuid)) {
+    redirect("/staff?error=revision_invalida");
+  }
+  const fail = (code: string): never =>
+    redirect("/staff/" + employeeId + "?error=" + encodeURIComponent(code));
+  if (!["approve", "reject"].includes(decision) || reason.length < 15 || reason.length > 1000) {
+    fail("Datos incompletos para decidir la solicitud.");
+  }
+  const access = await requireStaffEmployeeSiteAccess(employeeId, "workforce.employees.view");
+  if (access.isSharedDevice || access.operatorId === employeeId) {
+    fail("Esta sesión no puede aprobar su propia asistencia.");
+  }
+  // Site permission must belong to the actual actor. Workforce read access
+  // is not sufficient to decide ANIMA attendance.
+  const { data: canDecide, error: permissionError } = await access.authClient.rpc(
+    "has_permission", {
+      p_permission_code: "anima.attendance.checkout_review.decide",
+      p_site_id: access.authorizedSiteId,
+      p_area_id: null,
+    }
+  );
+  if (permissionError || canDecide !== true) {
+    fail("Falta autorización expresa para revisar salidas de esta sede.");
+  }
+  const { data: ticket, error: ticketError } = await access.supabase
+    .from("support_tickets")
+    .select("id,site_id,category,status,created_by,target_employee_id")
+    .eq("id", ticketId)
+    .eq("site_id", access.authorizedSiteId)
+    .eq("category", "attendance")
+    .maybeSingle();
+  if (ticketError || !ticket || (ticket.target_employee_id ?? ticket.created_by) !== employeeId
+      || !["open", "in_progress"].includes(ticket.status)) {
+    fail("La solicitud ya no está disponible en esta sede.");
+  }
+  let checkoutAt: string | null = null;
+  if (decision === "approve") {
+    // Site time is explicitly America/Bogota (UTC-05:00); never parse
+    // a timezone-less date in the Next.js server's own timezone.
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(localTime)) {
+      fail("Selecciona la fecha y hora exactas de salida.");
+    }
+    const instant = new Date(localTime + ":00-05:00");
+    if (!Number.isFinite(instant.getTime()) || instant.getTime() > Date.now()) {
+      fail("La hora de salida no es válida.");
+    }
+    checkoutAt = instant.toISOString();
+  }
+  // The RPC owns the final session/shift/territory checks, serialized write,
+  // case resolution and immutable audit. A timeout is NOT confirmation.
+  const { data, error } = await access.authClient.rpc("decide_attendance_checkout_review_v1", {
+    p_ticket_id: ticketId,
+    p_check_in_log_id: checkInId,
+    p_decision: decision,
+    p_reason: reason,
+    p_checkout_at: checkoutAt,
+  });
+  const outcome = Array.isArray(data) ? data[0]?.result : null;
+  if (error || !["applied", "duplicate"].includes(outcome)) {
+    fail("No se confirmó la decisión. Revisa el caso antes de reintentar.");
+  }
+  revalidatePath("/staff/" + employeeId);
+  redirect("/staff/" + employeeId + "?ok=" +
+    (decision === "approve" ? "attendance_review_approved" : "attendance_review_rejected"));
+}
+
 export default async function StaffDetailPage({
   params,
   searchParams,
@@ -1473,7 +1563,11 @@ export default async function StaffDetailPage({
   const sp = (await searchParams) ?? {};
   const okRaw = sp.ok ? safeDecode(sp.ok) : "";
   const okMsg =
-    okRaw === "photo_uploaded"
+    okRaw === "attendance_review_approved"
+      ? "Salida excepcional confirmada por ANIMA y vinculada a su revisión."
+      : okRaw === "attendance_review_rejected"
+        ? "Solicitud rechazada: no se modificó la asistencia."
+        : okRaw === "photo_uploaded"
       ? "Foto actualizada correctamente."
       : okRaw === "document_uploaded"
         ? "Documento subido correctamente."
@@ -1545,7 +1639,7 @@ export default async function StaffDetailPage({
       .maybeSingle(),
     supabase
       .from("attendance_logs")
-      .select("id,action,occurred_at,source,accuracy_meters,site_id,site:sites(id,name,code)")
+      .select("id,action,occurred_at,source,accuracy_meters,site_id,shift_id,site:sites(id,name,code)")
       .eq("employee_id", id)
       .eq("site_id", authorizedSiteId)
       .order("occurred_at", { ascending: false })
@@ -1626,6 +1720,30 @@ export default async function StaffDetailPage({
   const canEditPhoto = !photoPermission.error && Boolean(photoPermission.data);
   const canManagePermissions = !permissionsPermission.error && Boolean(permissionsPermission.data);
   const canManageStaff = !managePermission.error && Boolean(managePermission.data);
+  const { data: reviewerGrant, error: reviewerGrantError } = await authClient.rpc(
+    "has_permission", {
+      p_permission_code: "anima.attendance.checkout_review.decide",
+      p_site_id: authorizedSiteId,
+      p_area_id: null,
+    }
+  );
+  const canDecideAttendanceReview = reviewerGrant === true && !reviewerGrantError &&
+    !staffAccess.isSharedDevice && staffAccess.operatorId !== id;
+  // Read site-scoped ANIMA requests only after an effective decision grant.
+  const { data: reviewTicketsData, error: reviewTicketsError } = canDecideAttendanceReview
+    ? await supabase
+      .from("support_tickets")
+      .select("id,title,description,status,site_id,created_by,target_employee_id")
+      .eq("category", "attendance")
+      .eq("site_id", authorizedSiteId)
+      .in("status", ["open", "in_progress"])
+      .or("target_employee_id.eq." + id +
+        ",and(target_employee_id.is.null,created_by.eq." + id + ")")
+      .order("created_at", { ascending: false })
+      .limit(20)
+    : { data: [], error: null };
+  const pendingAttendanceReviews = (reviewTicketsError ? [] :
+    (reviewTicketsData ?? [])) as AttendanceReviewTicketRow[];
   const canReadGlobalEmployeePermissions = canManagePermissions &&
     await requireStaffGlobalPermission(staffAccess, "staff.permissions.manage", true);
   const { data: employeePermissionRows, error: employeePermissionError } = await supabase
@@ -1640,6 +1758,8 @@ export default async function StaffDetailPage({
   const siteLinks = (employeeSites ?? []) as EmployeeSiteRow[];
   const attendance = (attendanceStatus ?? null) as AttendanceStatusRow | null;
   const attendanceRows = (attendanceLogs ?? []) as AttendanceLogRow[];
+  const reviewableCheckIn = attendanceRows[0]?.action === "check_in" &&
+    attendanceRows[0]?.shift_id ? attendanceRows[0] : null;
   const shiftRows = (shifts ?? []) as ShiftRow[];
   const areaRows = (areasData ?? []) as AreaRow[];
   const inventoryLocationRows = (inventoryLocationsData ?? []) as InventoryLocationRow[];
@@ -2206,6 +2326,81 @@ export default async function StaffDetailPage({
               })}
             </TableBody>
             </Table>
+          </div>
+        )}
+      </div>
+
+      <div className="ui-panel space-y-4">
+        <div>
+          <div className="ui-h3">Revisión administrativa de salidas</div>
+          <p className="ui-body-muted mt-1">
+            ANIMA conserva la autoridad sobre las marcaciones. Un ticket no registra una salida:
+            solo una decisión autenticada, justificada y confirmada por el servidor puede hacerlo.
+          </p>
+        </div>
+        {!canDecideAttendanceReview ? (
+          <div className="ui-alert">
+            Las correcciones requieren permiso administrativo específico por sede.
+            La consulta del trabajador no concede autoridad para cerrar asistencia.
+          </div>
+        ) : pendingAttendanceReviews.length === 0 ? (
+          <div className="ui-empty">No hay solicitudes de asistencia pendientes en esta sede.</div>
+        ) : !reviewableCheckIn ? (
+          <div className="ui-alert">
+            Hay solicitudes pendientes, pero no se encontró una entrada publicada y abierta
+            en esta sede. Revisa los eventos antes de tomar una decisión.
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <p className="ui-caption">
+              Entrada de referencia: {formatDateTime(reviewableCheckIn.occurred_at)}.
+              La sesión, el turno y la concurrencia se vuelven a comprobar en ANIMA al decidir.
+            </p>
+            {pendingAttendanceReviews.map((ticket) => (
+              <div key={ticket.id} className="rounded-2xl border border-[var(--ui-border)] p-4 space-y-4">
+                <div>
+                  <div className="font-semibold text-[var(--ui-text)]">{ticket.title}</div>
+                  {ticket.description ? <p className="ui-body-muted mt-1">{ticket.description}</p> : null}
+                  <div className="ui-caption mt-1">Estado: {ticket.status === "open" ? "Abierta" : "En revisión"}</div>
+                </div>
+                <form action={decideAttendanceCheckoutReview} className="grid gap-3 md:grid-cols-2">
+                  <input type="hidden" name="employee_id" value={emp.id} />
+                  <input type="hidden" name="ticket_id" value={ticket.id} />
+                  <input type="hidden" name="check_in_log_id" value={reviewableCheckIn.id} />
+                  <input type="hidden" name="decision" value="approve" />
+                  <label className="space-y-2">
+                    <span className="ui-label">Hora real de salida (Bogotá, UTC−05:00)</span>
+                    <input name="checkout_local" type="datetime-local" className="ui-input" required />
+                  </label>
+                  <label className="space-y-2 md:col-span-2">
+                    <span className="ui-label">Motivo y evidencia de aprobación</span>
+                    <textarea name="reason" className="ui-input min-h-20" minLength={15} maxLength={1000}
+                      placeholder="Describe la evidencia revisada para confirmar la salida"
+                      required />
+                  </label>
+                  <div className="md:col-span-2">
+                    <button type="submit" className="ui-btn ui-btn--brand">
+                      Aprobar salida verificada
+                    </button>
+                  </div>
+                </form>
+                <form action={decideAttendanceCheckoutReview} className="flex flex-wrap items-end gap-3 border-t border-[var(--ui-border)] pt-3">
+                  <input type="hidden" name="employee_id" value={emp.id} />
+                  <input type="hidden" name="ticket_id" value={ticket.id} />
+                  <input type="hidden" name="check_in_log_id" value={reviewableCheckIn.id} />
+                  <input type="hidden" name="decision" value="reject" />
+                  <label className="flex-1 space-y-2">
+                    <span className="ui-label">Motivo de rechazo</span>
+                    <textarea name="reason" className="ui-input min-h-20" minLength={15} maxLength={1000}
+                      placeholder="Indica qué evidencia falta o por qué se rechaza"
+                      required />
+                  </label>
+                  <button type="submit" className="ui-btn ui-btn--ghost">
+                    Rechazar sin marcar salida
+                  </button>
+                </form>
+              </div>
+            ))}
           </div>
         )}
       </div>

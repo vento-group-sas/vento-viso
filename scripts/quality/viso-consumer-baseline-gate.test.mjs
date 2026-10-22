@@ -1672,3 +1672,77 @@ test('GAP-PKG-004 VISO Next SSR anonymously rejects a real staff detail HTTP req
     }
   });
 
+test('GAP-PKG-004 VISO administrative review requires actor-site grant and delegates to ANIMA', async () => {
+  const source = fs.readFileSync(
+    new URL('../../src/app/staff/[id]/page.tsx', import.meta.url), 'utf8',
+  );
+  const start = source.indexOf('async function decideAttendanceCheckoutReview(');
+  const end = source.indexOf('\nexport default async function StaffDetailPage(', start);
+  assert.ok(start >= 0 && end > start, 'Review action must exist on staff detail');
+  const action = source.slice(start, end);
+  assert.match(action, /await requireStaffEmployeeSiteAccess\(employeeId, "workforce\.employees\.view"\)/u);
+  assert.match(action, /access\.isSharedDevice \|\| access\.operatorId === employeeId/u);
+  assert.match(action, /"anima\.attendance\.checkout_review\.decide"/u);
+  assert.match(action, /access\.authClient\.rpc\("decide_attendance_checkout_review_v1"/u);
+  assert.match(action, /ticket\.target_employee_id \?\? ticket\.created_by/u);
+  assert.match(action, /access\.authorizedSiteId/u);
+  assert.match(action, /checkoutAt = instant\.toISOString\(\)/u);
+  assert.doesNotMatch(action, /from\("attendance_logs"\)\.(?:insert|update|delete)|supabaseServiceRoleKey/iu);
+  assert.match(source, /type="datetime-local"/u);
+  assert.match(source, /Rechazar sin marcar salida/u);
+
+  const worker = 'b0040000-0000-4000-8000-000000000001';
+  const manager = 'b0040000-0000-4000-8000-000000000002';
+  const site = 'b0040000-0000-4000-8000-000000000003';
+  const ticket = 'b0040000-0000-4000-8000-000000000004';
+  const entry = 'b0040000-0000-4000-8000-000000000005';
+  const values = new Map([
+    ['employee_id', worker], ['ticket_id', ticket], ['check_in_log_id', entry],
+    ['decision', 'reject'], ['reason', 'No hay evidencia comprobable de salida.'],
+  ]);
+  const form = { get: (key) => values.get(key) ?? null };
+  const calls = [];
+  let allowed = false;
+  const authClient = { rpc: async (name, args) => {
+    calls.push({ name, args });
+    if (name === 'has_permission') return { data: allowed, error: null };
+    if (name === 'decide_attendance_checkout_review_v1') {
+      return { data: [{ result: 'applied' }], error: null };
+    }
+    throw new Error('Unexpected RPC');
+  } };
+  const query = {
+    select() { return this; },
+    eq() { return this; },
+    async maybeSingle() {
+      return { data: { id: ticket, site_id: site, category: 'attendance',
+        created_by: worker, target_employee_id: null, status: 'open' }, error: null };
+    },
+  };
+  const sandbox = {
+    asText: (x) => typeof x === 'string' ? x.trim() : '',
+    requireStaffEmployeeSiteAccess: async () => ({
+      authClient, supabase: { from: () => query },
+      isSharedDevice: false, operatorId: manager, authorizedSiteId: site,
+    }),
+    redirect: (url) => { throw new Error('REDIRECT:' + url); },
+    revalidatePath: () => {},
+    Date,
+    encodeURIComponent,
+  };
+  const executable = stripTypeScriptTypes(action) + '\ndecideAttendanceCheckoutReview';
+  const decide = runInNewContext(executable, sandbox);
+  await assert.rejects(decide(form), /Falta%20autorizaci%C3%B3n/u);
+  assert.deepEqual(calls.map((x) => x.name), ['has_permission'],
+    'No owner mutation RPC without effective actor-site permission');
+  allowed = true;
+  calls.length = 0;
+  await assert.rejects(decide(form), /attendance_review_rejected/u);
+  assert.deepEqual(calls.map((x) => x.name),
+    ['has_permission', 'decide_attendance_checkout_review_v1']);
+  assert.equal(calls[1].args.p_ticket_id, ticket);
+  assert.equal(calls[1].args.p_check_in_log_id, entry);
+  assert.equal(calls[1].args.p_decision, 'reject');
+  assert.equal(calls[1].args.p_checkout_at, null);
+});
+
