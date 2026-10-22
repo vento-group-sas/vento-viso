@@ -243,6 +243,117 @@ function asText(value: FormDataEntryValue | null) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+type StaffGlobalAccess = {
+  authClient: Awaited<ReturnType<typeof requireAppAccess>>["supabase"];
+  supabase: ReturnType<typeof createAdminClient>;
+  isSharedDevice: boolean;
+  operatorId: string;
+  actualRole: string | null;
+};
+
+// The admin client bypasses RLS: authorize the operator's active site and
+// the target's active assignment BEFORE accessing employee-wide data.
+// Cross-site access additionally requires proven, effective GLOBAL scope.
+async function requireStaffEmployeeSiteAccess(employeeId: string, permissionCode: string) {
+  const returnTo = `/staff/${employeeId}`;
+  const access = await requireAppAccess({
+    appId: "viso",
+    returnTo,
+    permissionCode,
+  });
+  const operatorSiteId = String(access.siteId ?? "").trim();
+  const deny = (): never => {
+    const params = new URLSearchParams({
+      returnTo,
+      reason: "staff_site_scope_denied",
+      permission: `viso.${permissionCode}`,
+    });
+    redirect(`/no-access?${params.toString()}`);
+  };
+
+  // Site IDs interpolate into PostgREST OR filters: validate both the
+  // operational site and any cross-site fallback before returning either.
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value);
+  if (!employeeId || !isUuid(operatorSiteId)) deny();
+
+  const supabase = createAdminClient();
+  const isSharedDevice = access.operationalSession.isSharedDevice;
+
+  // A human operator must belong actively to the operational session's site.
+  // A shared device can only act at its trusted device site.
+  if (!isSharedDevice) {
+    const { data: operatorSite, error: operatorSiteError } = await supabase
+      .from("employee_sites")
+      .select("employee_id")
+      .eq("employee_id", access.user.id)
+      .eq("site_id", operatorSiteId)
+      .eq("is_active", true)
+      .maybeSingle();
+    if (operatorSiteError || !operatorSite) deny();
+  }
+
+  const { data: targetSite, error: targetSiteError } = await supabase
+    .from("employee_sites")
+    .select("employee_id")
+    .eq("employee_id", employeeId)
+    .eq("site_id", operatorSiteId)
+    .eq("is_active", true)
+    .maybeSingle();
+  if (targetSiteError) deny();
+
+  let authorizedSiteId = operatorSiteId;
+  if (!targetSite) {
+    // Never promote site-only grants (or a shared device) to cross-site access.
+    if (isSharedDevice) deny();
+    await requireStaffGlobalPermission({
+      authClient: access.supabase,
+      supabase,
+      isSharedDevice,
+      operatorId: access.user.id,
+      actualRole: access.operationalSession.role,
+    }, permissionCode);
+
+    // Choose one deterministic ACTIVE assignment of the target. This does
+    // not confer access to other sites or to inactive assignments.
+    const { data: foreignSite, error: foreignSiteError } = await supabase
+      .from("employee_sites")
+      .select("site_id")
+      .eq("employee_id", employeeId)
+      .eq("is_active", true)
+      .order("is_primary", { ascending: false })
+      .order("site_id", { ascending: true })
+      .limit(1)
+      .maybeSingle();
+    const candidateSiteId = String(foreignSite?.site_id ?? "").trim();
+    if (foreignSiteError || !isUuid(candidateSiteId)) deny();
+
+    // A global grant does not override a possible effective denial for this
+    // destination. Re-evaluate the authenticated actor with the target site.
+    const { data: sitePermission, error: sitePermissionError } = await access.supabase.rpc(
+      "has_permission", {
+        p_permission_code: `viso.${permissionCode}`,
+        p_site_id: candidateSiteId,
+        p_area_id: null,
+      }
+    );
+    if (sitePermissionError || sitePermission !== true) deny();
+    authorizedSiteId = candidateSiteId;
+  }
+
+  return {
+    authClient: access.supabase,
+    supabase,
+    authorizedSiteId,
+    isSharedDevice,
+    operatorId: access.user.id,
+    actualRole: access.operationalSession.role,
+    // Historical NULL-site documents remain employee-wide; explicit site IDs
+    // are confined to the authorized target assignment only.
+    documentSiteFilter: `site_id.is.null,site_id.eq.${authorizedSiteId}`,
+  };
+}
+
 function asBool(value: FormDataEntryValue | null) {
   return value === "on" || value === "true";
 }
@@ -275,6 +386,134 @@ function asNumber(value: FormDataEntryValue | null, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+// A NULL site argument in has_permission DOES NOT prove a global grant:
+// PostgreSQL can return true for a site-only employee grant. Verify the
+// explicit scope provenance under the real operator and role as well.
+async function requireStaffGlobalPermission(
+  access: StaffGlobalAccess,
+  permissionCode: string,
+  probeOnly = false,
+) {
+  // The read-only probe is for visibility of GLOBAL rows only.
+  // All mutation guards use the default and keep redirect-on-denial.
+  const deny = (): boolean => {
+    if (probeOnly) return false;
+    redirect(
+      `/no-access?reason=staff_global_scope_denied&permission=${encodeURIComponent(
+        `viso.${permissionCode}`
+      )}`
+    );
+  };
+  if (access.isSharedDevice || !access.operatorId) return deny();
+
+  const { data: effective, error: effectiveError } = await access.authClient.rpc("has_permission", {
+    p_permission_code: `viso.${permissionCode}`,
+    p_site_id: null,
+    p_area_id: null,
+  });
+  if (effectiveError || effective !== true) return deny();
+
+  const { data: app, error: appError } = await access.supabase
+    .from("apps")
+    .select("id")
+    .eq("code", "viso")
+    .maybeSingle();
+  if (appError || !app) return deny();
+
+  const { data: permission, error: permissionError } = await access.supabase
+    .from("app_permissions")
+    .select("id")
+    .eq("app_id", app.id)
+    .eq("code", permissionCode)
+    .maybeSingle();
+  if (permissionError || !permission) return deny();
+
+  const [{ data: employeeGlobal, error: employeeError },
+    { data: roleGlobal, error: roleError }] = await Promise.all([
+    access.supabase
+      .from("employee_permissions")
+      .select("id")
+      .eq("employee_id", access.operatorId)
+      .eq("permission_id", permission.id)
+      .eq("is_allowed", true)
+      .eq("scope_type", "global")
+      .is("scope_site_id", null)
+      .is("scope_area_id", null)
+      .is("scope_site_type", null)
+      .is("scope_area_kind", null)
+      .limit(1)
+      .maybeSingle(),
+    access.actualRole
+      ? access.supabase
+        .from("role_permissions")
+        .select("permission_id")
+        .eq("role", access.actualRole)
+        .eq("permission_id", permission.id)
+        .eq("is_allowed", true)
+        .or("scope_type.eq.global,scope_type.is.null")
+        .is("scope_site_id", null)
+        .is("scope_area_id", null)
+        .is("scope_site_type", null)
+        .is("scope_area_kind", null)
+        .limit(1)
+        .maybeSingle()
+      : Promise.resolve({ data: null, error: null }),
+  ]);
+
+  if (employeeError || roleError || (!employeeGlobal && !roleGlobal)) return deny();
+  return true;
+}
+
+// Include only the active operator's site grants unless its *explicit*
+// GLOBAL staff.permissions.manage provenance was verified. A null site alone
+// is never treated as a global grant.
+function employeePermissionScopeFilter(authorizedSiteId: string, allowGlobal: boolean) {
+  const local = `scope_site_id.eq.${authorizedSiteId}`;
+  return allowGlobal
+    ? `${local},and(scope_type.eq.global,scope_site_id.is.null,scope_area_id.is.null,scope_site_type.is.null,scope_area_kind.is.null)`
+    : local;
+}
+
+async function requireStaffAdministrativeSiteAccess(
+  employeeId: string,
+  permissionCode: string,
+  requestedSiteId?: string,
+  requireActiveAssignment = true,
+) {
+  const access = await requireStaffEmployeeSiteAccess(employeeId, permissionCode);
+  if (requestedSiteId && requestedSiteId !== access.authorizedSiteId) {
+    // A GLOBAL grant never bypasses an effective denial for the destination.
+    // Validate the requested site before any privileged mutation.
+    if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(requestedSiteId)) {
+      redirect("/no-access?reason=staff_target_site_invalid");
+    }
+    await requireStaffGlobalPermission(access, permissionCode);
+    const { data: targetPermission, error: targetPermissionError } = await access.authClient.rpc(
+      "has_permission", {
+        p_permission_code: `viso.${permissionCode}`,
+        p_site_id: requestedSiteId,
+        p_area_id: null,
+      }
+    );
+    if (targetPermissionError || targetPermission !== true) {
+      redirect("/no-access?reason=staff_target_site_permission_denied");
+    }
+    if (requireActiveAssignment) {
+      const { data: assignment, error } = await access.supabase
+        .from("employee_sites")
+        .select("employee_id")
+        .eq("employee_id", employeeId)
+        .eq("site_id", requestedSiteId)
+        .eq("is_active", true)
+        .maybeSingle();
+      if (error || !assignment) {
+        redirect("/no-access?reason=staff_target_site_inactive");
+      }
+    }
+  }
+  return access;
+}
+
 async function saveEmployeeAreaPurposeAssignment(formData: FormData): Promise<StaffAreaPurposeAssignmentResult> {
   "use server";
   const employeeId = asText(formData.get("employee_id"));
@@ -287,12 +526,7 @@ async function saveEmployeeAreaPurposeAssignment(formData: FormData): Promise<St
     return { ok: false, error: "Faltan empleado o sede para asignar área." };
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId);
 
   if (!areaId) {
     const { error: delError } = await supabase
@@ -321,8 +555,8 @@ async function saveEmployeeAreaPurposeAssignment(formData: FormData): Promise<St
     return { ok: false, error: "Área inválida." };
   }
 
-  if (String(areaCheck.site_id ?? "") !== siteId) {
-    return { ok: false, error: "El área no pertenece a la sede seleccionada." };
+  if (String(areaCheck.site_id ?? "") !== siteId || areaCheck.is_active !== true) {
+    return { ok: false, error: "El área no está activa en la sede autorizada." };
   }
 
   const { error } = await supabase.from("employee_area_purpose_assignments").upsert(
@@ -356,12 +590,7 @@ async function saveEmployeeInventoryLocationAssignment(formData: FormData): Prom
     return { ok: false, error: "Faltan trabajador o sede para asignar LOC." };
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId);
 
   if (!locationId) {
     const { error: delError } = await supabase
@@ -390,8 +619,8 @@ async function saveEmployeeInventoryLocationAssignment(formData: FormData): Prom
     return { ok: false, error: "LOC inválido." };
   }
 
-  if (String(locationCheck.site_id ?? "") !== siteId) {
-    return { ok: false, error: "El LOC no pertenece a la sede seleccionada." };
+  if (String(locationCheck.site_id ?? "") !== siteId || locationCheck.is_active !== true) {
+    return { ok: false, error: "El LOC no está activo en la sede autorizada." };
   }
 
   const { error } = await supabase.from("employee_inventory_location_assignments").upsert(
@@ -428,12 +657,9 @@ async function setEmployeeKioskPin(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("El PIN debe tener entre 4 y 8 digitos.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const access = await requireStaffEmployeeSiteAccess(employeeId, "staff.manage");
+  await requireStaffGlobalPermission(access, "staff.manage");
+  const { supabase } = access;
 
   const { error } = await supabase.rpc("set_employee_kiosk_pin", {
     p_employee_id: employeeId,
@@ -464,14 +690,12 @@ async function updateEmployee(formData: FormData) {
     redirect(`/staff/${id}?error=${encodeURIComponent("Faltan campos obligatorios.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${id}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const access = await requireStaffAdministrativeSiteAccess(id, "staff.manage", siteId);
+  // Role, activation and identity are shared across all employee sites.
+  await requireStaffGlobalPermission(access, "staff.manage");
+  const { supabase } = access;
 
-  const { error } = await supabase
+  const { data: changed, error } = await supabase
     .from("employees")
     .update({
       full_name: fullName,
@@ -482,10 +706,13 @@ async function updateEmployee(formData: FormData) {
       site_id: siteId,
       is_active: isActive,
     })
-    .eq("id", id);
+    .eq("id", id)
+    .select("id");
 
-  if (error) {
-    redirect(`/staff/${id}?error=${encodeURIComponent(error.message)}`);
+  if (error || !changed?.length) {
+    redirect(`/staff/${id}?error=${encodeURIComponent(
+      error?.message ?? "No se actualizó ningún trabajador autorizado."
+    )}`);
   }
 
   revalidatePath(`/staff/${id}`);
@@ -498,16 +725,16 @@ async function deleteEmployee(formData: FormData) {
   const id = asText(formData.get("id"));
   if (!id) redirect("/staff?error=" + encodeURIComponent("Empleado inválido."));
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${id}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const access = await requireStaffEmployeeSiteAccess(id, "staff.manage");
+  await requireStaffGlobalPermission(access, "staff.manage");
+  const { supabase } = access;
 
-  const { error } = await supabase.from("employees").delete().eq("id", id);
-  if (error) {
-    redirect(`/staff/${id}?error=${encodeURIComponent(error.message)}`);
+  const { data: deleted, error } = await supabase
+    .from("employees").delete().eq("id", id).select("id");
+  if (error || !deleted?.length) {
+    redirect(`/staff/${id}?error=${encodeURIComponent(
+      error?.message ?? "No se eliminó ningún trabajador autorizado."
+    )}`);
   }
 
   revalidatePath("/staff");
@@ -524,12 +751,9 @@ async function addEmployeeSite(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Selecciona una sede.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const access = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId, false);
+  if (makePrimary) await requireStaffGlobalPermission(access, "staff.manage");
+  const { supabase } = access;
 
   const { data: employeeRow, error: employeeFetchError } = await supabase
     .from("employees")
@@ -558,13 +782,16 @@ async function addEmployeeSite(formData: FormData) {
   }
 
   const nextPrimarySiteId = makePrimary ? siteId : currentPrimarySiteId || siteId;
-  const { error: primaryError } = await supabase
+  const { data: assignedPrimary, error: primaryError } = await supabase
     .from("employees")
     .update({ site_id: nextPrimarySiteId, updated_at: new Date().toISOString() })
-    .eq("id", employeeId);
+    .eq("id", employeeId)
+    .select("id");
 
-  if (primaryError) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(primaryError.message)}`);
+  if (primaryError || !assignedPrimary?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      primaryError?.message ?? "No se actualizó la sede principal."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -580,20 +807,20 @@ async function setPrimarySite(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Sede invalida.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const access = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId);
+  await requireStaffGlobalPermission(access, "staff.manage");
+  const { supabase } = access;
 
-  const { error } = await supabase
+  const { data: primaryUpdated, error } = await supabase
     .from("employees")
     .update({ site_id: siteId, updated_at: new Date().toISOString() })
-    .eq("id", employeeId);
+    .eq("id", employeeId)
+    .select("id");
 
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(error.message)}`);
+  if (error || !primaryUpdated?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error?.message ?? "No se modificó la sede principal."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -606,12 +833,7 @@ async function toggleEmployeeSite(formData: FormData) {
   const siteId = asText(formData.get("site_id"));
   const nextActive = asBool(formData.get("is_active"));
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId, false);
 
   const { data: employeeRow, error: employeeFetchError } = await supabase
     .from("employees")
@@ -625,14 +847,17 @@ async function toggleEmployeeSite(formData: FormData) {
 
   const currentPrimarySiteId = String(employeeRow?.site_id ?? "").trim();
 
-  const { error } = await supabase
+  const { data: changedSite, error } = await supabase
     .from("employee_sites")
     .update({ is_active: nextActive })
     .eq("employee_id", employeeId)
-    .eq("site_id", siteId);
+    .eq("site_id", siteId)
+    .select("employee_id");
 
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(error.message)}`);
+  if (error || !changedSite?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error?.message ?? "Asignación de sede no encontrada."
+    )}`);
   }
 
   if (nextActive && currentPrimarySiteId && currentPrimarySiteId !== siteId) {
@@ -655,21 +880,19 @@ async function removeEmployeeSite(formData: FormData) {
   const employeeId = asText(formData.get("employee_id"));
   const siteId = asText(formData.get("site_id"));
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId, false);
 
-  const { error } = await supabase
+  const { data: removedSite, error } = await supabase
     .from("employee_sites")
     .delete()
     .eq("employee_id", employeeId)
-    .eq("site_id", siteId);
+    .eq("site_id", siteId)
+    .select("employee_id");
 
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(error.message)}`);
+  if (error || !removedSite?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error?.message ?? "Asignación de sede no encontrada."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -691,13 +914,9 @@ async function uploadStaffDocument(formData: FormData) {
     return { ok: false, error: "Faltan empleado o tipo de documento." };
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.documents.manage",
-  });
-
-  const supabase = createAdminClient();
+  const { supabase, authorizedSiteId, documentSiteFilter } = await requireStaffEmployeeSiteAccess(
+    employeeId, "staff.documents.manage"
+  );
   let storagePath = "";
 
   const failAndCleanup = async (message: string) => {
@@ -792,7 +1011,7 @@ async function uploadStaffDocument(formData: FormData) {
     scope: "employee",
     owner_employee_id: employeeId,
     target_employee_id: employeeId,
-    site_id: null,
+    site_id: authorizedSiteId,
     title: docType.name ?? "Documento",
     description: null,
     storage_path: storagePath,
@@ -822,33 +1041,40 @@ async function uploadStaffDocument(formData: FormData) {
       .select("id,storage_path")
       .eq("target_employee_id", employeeId)
       .eq("document_type_id", documentTypeId)
-      .neq("id", insertedDocument.id);
+      .neq("id", insertedDocument.id)
+      .or(documentSiteFilter);
 
     if (previousDocsError) {
       return { ok: false, error: "Documento subido, pero no se pudo revisar duplicados: " + previousDocsError.message };
     }
 
     const previousIds = (previousDocs ?? []).map((doc) => doc.id).filter(Boolean);
-    const previousStoragePaths = (previousDocs ?? [])
-      .map((doc) => (typeof doc.storage_path === "string" ? doc.storage_path : ""))
-      .filter((path) => path && isSafeStaffDocumentPath(path, employeeId));
-
+    let deletedStoragePaths: string[] = [];
     if (previousIds.length > 0) {
-      const { error: deletePreviousError } = await supabase
+      const { data: deletedPreviousDocs, error: deletePreviousError } = await supabase
         .from("documents")
         .delete()
         .in("id", previousIds)
-        .eq("target_employee_id", employeeId);
+        .eq("target_employee_id", employeeId)
+        .or(documentSiteFilter)
+        .select("id,storage_path");
 
       if (deletePreviousError) {
         return { ok: false, error: "Documento subido, pero no se pudo reemplazar el anterior: " + deletePreviousError.message };
       }
+      if ((deletedPreviousDocs ?? []).length !== previousIds.length) {
+        return { ok: false, error: "Documento subido, pero cambiaron las asignaciones de los documentos anteriores." };
+      }
+      // Delete only Storage objects from rows that were actually deleted.
+      deletedStoragePaths = (deletedPreviousDocs ?? [])
+        .map((doc) => (typeof doc.storage_path === "string" ? doc.storage_path : ""))
+        .filter((path) => path && isSafeStaffDocumentPath(path, employeeId));
     }
 
-    if (previousStoragePaths.length > 0) {
+    if (deletedStoragePaths.length > 0) {
       const { error: removePreviousFilesError } = await supabase.storage
         .from(DOCUMENT_BUCKET)
-        .remove(previousStoragePaths);
+        .remove(deletedStoragePaths);
 
       if (removePreviousFilesError) {
         return {
@@ -879,13 +1105,9 @@ async function updateStaffDocument(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Faltan documento o empleado.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.documents.manage",
-  });
-
-  const supabase = createAdminClient();
+  const { supabase, documentSiteFilter } = await requireStaffEmployeeSiteAccess(
+    employeeId, "staff.documents.manage"
+  );
 
   if (documentAction === "delete") {
     const { data: docRow, error: findError } = await supabase
@@ -893,6 +1115,7 @@ async function updateStaffDocument(formData: FormData) {
       .select("id,storage_path")
       .eq("id", documentId)
       .eq("target_employee_id", employeeId)
+      .or(documentSiteFilter)
       .maybeSingle();
 
     if (findError) {
@@ -905,14 +1128,18 @@ async function updateStaffDocument(formData: FormData) {
 
     const storagePath = typeof docRow.storage_path === "string" ? docRow.storage_path : "";
 
-    const { error: deleteError } = await supabase
+    const { data: deletedDocs, error: deleteError } = await supabase
       .from("documents")
       .delete()
       .eq("id", documentId)
-      .eq("target_employee_id", employeeId);
+      .eq("target_employee_id", employeeId)
+      .or(documentSiteFilter)
+      .select("id");
 
-    if (deleteError) {
-      redirect(`/staff/${employeeId}?error=${encodeURIComponent("Error al eliminar el documento: " + deleteError.message)}`);
+    if (deleteError || !deletedDocs?.length) {
+      redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+        deleteError ? "Error al eliminar el documento: " + deleteError.message : "Documento no encontrado en la sede autorizada."
+      )}`);
     }
 
     if (storagePath && isSafeStaffDocumentPath(storagePath, employeeId)) {
@@ -936,14 +1163,18 @@ async function updateStaffDocument(formData: FormData) {
   if (expiryDate !== undefined) updates.expiry_date = expiryDate;
   if (title !== undefined) updates.title = title;
 
-  const { error } = await supabase
+  const { data: updatedDocs, error } = await supabase
     .from("documents")
     .update(updates)
     .eq("id", documentId)
-    .eq("target_employee_id", employeeId);
+    .eq("target_employee_id", employeeId)
+    .or(documentSiteFilter)
+    .select("id");
 
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent("Error al actualizar: " + error.message)}`);
+  if (error || !updatedDocs?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error ? "Error al actualizar: " + error.message : "Documento no encontrado en la sede autorizada."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -961,21 +1192,11 @@ async function uploadStaffPhoto(formData: FormData) {
     redirect("/staff?error=" + encodeURIComponent("Trabajador inválido."));
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.employee_photos.manage",
-  });
-
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffEmployeeSiteAccess(employeeId, "staff.employee_photos.manage");
 
   const failAndCleanup = async (message: string): Promise<never> => {
-    const extension = PHOTO_MIME_EXTENSIONS[mime];
-
-    if (storagePath && extension && isSafeStaffPhotoPath(storagePath, employeeId, extension)) {
-      await supabase.storage.from(PHOTO_BUCKET).remove([storagePath]);
-    }
-
+    // A caller-provided path is NOT proof that this request created the file.
+    // Never grant an arbitrary Storage deletion through error cleanup.
     redirect(`/staff/${employeeId}?error=${encodeURIComponent(message)}`);
   };
 
@@ -1013,7 +1234,7 @@ async function uploadStaffPhoto(formData: FormData) {
     .eq("id", employeeId);
 
   if (error) {
-    await supabase.storage.from(PHOTO_BUCKET).remove([storagePath]);
+    // Do not delete caller-supplied Storage objects using the admin client.
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Error al guardar la foto: " + error.message)}`);
   }
 
@@ -1034,12 +1255,11 @@ async function grantEmployeePermission(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Faltan trabajador o permiso.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.permissions.manage",
-  });
-  const supabase = createAdminClient();
+  const access = await requireStaffEmployeeSiteAccess(employeeId, "staff.permissions.manage");
+  if (scopeType === "global") {
+    await requireStaffGlobalPermission(access, "staff.permissions.manage");
+  }
+  const { supabase, authorizedSiteId } = access;
 
   const { data: permission, error: permissionError } = await supabase
     .from("app_permissions")
@@ -1054,18 +1274,9 @@ async function grantEmployeePermission(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Permiso inválido o no encontrado.")}`);
   }
 
-  let scopeSiteId: string | null = null;
-  if (scopeType === "site") {
-    const { data: employee } = await supabase
-      .from("employees")
-      .select("site_id")
-      .eq("id", employeeId)
-      .maybeSingle();
-    scopeSiteId = employee?.site_id ?? null;
-    if (!scopeSiteId) {
-      redirect(`/staff/${employeeId}?error=${encodeURIComponent("El trabajador no tiene sede principal para alcance por sede.")}`);
-    }
-  }
+  // Never take a site-scope permission from the employee's OTHER primary
+  // site; bind it to the operator's independently authorized site.
+  const scopeSiteId: string | null = scopeType === "site" ? authorizedSiteId : null;
 
   let cleanup = supabase
     .from("employee_permissions")
@@ -1108,21 +1319,35 @@ async function removeEmployeePermission(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Permiso inválido.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.permissions.manage",
-  });
-  const supabase = createAdminClient();
-
-  const { error } = await supabase
+  const access = await requireStaffEmployeeSiteAccess(employeeId, "staff.permissions.manage");
+  const { supabase, authorizedSiteId } = access;
+  const { data: existing, error: lookupError } = await supabase
+    .from("employee_permissions")
+    .select("id,scope_type,scope_site_id")
+    .eq("id", permissionRowId)
+    .eq("employee_id", employeeId)
+    .maybeSingle();
+  if (lookupError || !existing) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent("Permiso no encontrado.")}`);
+  }
+  if (existing.scope_type === "global" ||
+      (existing.scope_site_id && existing.scope_site_id !== authorizedSiteId)) {
+    await requireStaffGlobalPermission(access, "staff.permissions.manage");
+  }
+  let removal = supabase
     .from("employee_permissions")
     .delete()
     .eq("id", permissionRowId)
-    .eq("employee_id", employeeId);
-
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(error.message)}`);
+    .eq("employee_id", employeeId)
+    .eq("scope_type", existing.scope_type);
+  removal = existing.scope_site_id
+    ? removal.eq("scope_site_id", existing.scope_site_id)
+    : removal.is("scope_site_id", null);
+  const { data: removed, error } = await removal.select("id");
+  if (error || !removed?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error?.message ?? "No se eliminó ningún permiso autorizado."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -1141,12 +1366,7 @@ async function createEmployeeShift(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Completa fecha, sede y horario del turno.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId);
 
   const payload = {
     employee_id: employeeId,
@@ -1184,14 +1404,9 @@ async function updateEmployeeShift(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Faltan datos para actualizar el turno.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase } = await requireStaffAdministrativeSiteAccess(employeeId, "staff.manage", siteId);
 
-  const { error } = await supabase
+  const { data: changedShifts, error } = await supabase
     .from("employee_shifts")
     .update({
       site_id: siteId,
@@ -1205,10 +1420,14 @@ async function updateEmployeeShift(formData: FormData) {
       published_by: null,
     })
     .eq("id", shiftId)
-    .eq("employee_id", employeeId);
+    .eq("employee_id", employeeId)
+    .eq("site_id", siteId)
+    .select("id");
 
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(error.message)}`);
+  if (error || !changedShifts?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error?.message ?? "Turno no encontrado en la sede autorizada."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -1224,21 +1443,20 @@ async function deleteEmployeeShift(formData: FormData) {
     redirect(`/staff/${employeeId}?error=${encodeURIComponent("Turno inválido.")}`);
   }
 
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${employeeId}`,
-    permissionCode: "staff.manage",
-  });
-  const supabase = createAdminClient();
+  const { supabase, authorizedSiteId } = await requireStaffEmployeeSiteAccess(employeeId, "staff.manage");
 
-  const { error } = await supabase
+  const { data: removedShifts, error } = await supabase
     .from("employee_shifts")
     .delete()
     .eq("id", shiftId)
-    .eq("employee_id", employeeId);
+    .eq("employee_id", employeeId)
+    .eq("site_id", authorizedSiteId)
+    .select("id");
 
-  if (error) {
-    redirect(`/staff/${employeeId}?error=${encodeURIComponent(error.message)}`);
+  if (error || !removedShifts?.length) {
+    redirect(`/staff/${employeeId}?error=${encodeURIComponent(
+      error?.message ?? "Turno no encontrado en la sede autorizada."
+    )}`);
   }
 
   revalidatePath(`/staff/${employeeId}`);
@@ -1279,12 +1497,8 @@ export default async function StaffDetailPage({
   const errorMsg = sp.error ? safeDecode(sp.error) : "";
   const { id } = await params;
 
-  const { supabase: authClient } = await requireAppAccess({
-    appId: "viso",
-    returnTo: `/staff/${id}`,
-    permissionCode: "staff.read",
-  });
-  const supabase = createAdminClient();
+  const staffAccess = await requireStaffEmployeeSiteAccess(id, "workforce.employees.view");
+  const { authClient, supabase, authorizedSiteId, documentSiteFilter } = staffAccess;
 
   const [
     { data: employee },
@@ -1310,6 +1524,7 @@ export default async function StaffDetailPage({
     supabase
       .from("sites")
       .select("id,name,code")
+      .eq("id", authorizedSiteId)
       .order("name", { ascending: true }),
     supabase
       .from("roles")
@@ -1320,33 +1535,39 @@ export default async function StaffDetailPage({
       .from("employee_sites")
       .select("site_id,is_primary,is_active,site:sites(id,name,code)")
       .eq("employee_id", id)
+      .eq("site_id", authorizedSiteId)
       .order("is_primary", { ascending: false }),
     supabase
       .from("employee_attendance_status")
       .select("employee_id,current_status,last_action_at,last_site_id")
       .eq("employee_id", id)
+      .eq("last_site_id", authorizedSiteId)
       .maybeSingle(),
     supabase
       .from("attendance_logs")
       .select("id,action,occurred_at,source,accuracy_meters,site_id,site:sites(id,name,code)")
       .eq("employee_id", id)
+      .eq("site_id", authorizedSiteId)
       .order("occurred_at", { ascending: false })
       .limit(20),
     supabase
       .from("employee_shifts")
       .select("id,shift_date,start_time,end_time,break_minutes,notes,status,site_id,published_at,site:sites(id,name,code)")
       .eq("employee_id", id)
+      .eq("site_id", authorizedSiteId)
       .order("shift_date", { ascending: true })
       .order("start_time", { ascending: true })
       .limit(40),
     supabase
       .from("areas")
       .select("id,site_id,name,kind,is_active")
+      .eq("site_id", authorizedSiteId)
       .eq("is_active", true)
       .order("name", { ascending: true }),
     supabase
       .from("inventory_locations")
       .select("id,site_id,area_id,code,description,zone,location_type,is_active")
+      .eq("site_id", authorizedSiteId)
       .eq("is_active", true)
       .order("description", { ascending: true })
       .order("code", { ascending: true }),
@@ -1356,23 +1577,27 @@ export default async function StaffDetailPage({
     supabase
       .from("site_area_purpose_rules")
       .select("site_id,area_kind,purpose,is_enabled")
+      .eq("site_id", authorizedSiteId)
       .eq("purpose", "remission")
       .eq("is_enabled", true),
     supabase
       .from("employee_area_purpose_assignments")
       .select("id,employee_id,site_id,area_id,purpose,is_active,area:areas(id,site_id,name,kind)")
       .eq("employee_id", id)
+      .eq("site_id", authorizedSiteId)
       .eq("is_active", true),
     supabase
       .from("employee_inventory_location_assignments")
       .select("id,employee_id,site_id,location_id,purpose,is_active,location:inventory_locations(id,site_id,area_id,code,description,zone)")
       .eq("employee_id", id)
+      .eq("site_id", authorizedSiteId)
       .eq("purpose", "kiosk_withdraw")
       .eq("is_active", true),
     supabase
       .from("documents")
       .select("id,title,status,issue_date,expiry_date,document_type:document_types(id,name)")
       .eq("target_employee_id", id)
+      .or(documentSiteFilter)
       .order("updated_at", { ascending: false }),
     supabase.rpc("employee_wallet_eligibility", { p_employee_id: id }).maybeSingle(),
     supabase
@@ -1385,10 +1610,6 @@ export default async function StaffDetailPage({
       .from("app_permissions")
       .select("id,code,name,app:apps(code)")
       .order("code", { ascending: true }),
-    supabase
-      .from("employee_permissions")
-      .select("id,is_allowed,scope_type,permission:app_permissions(id,code,name,app:apps(code))")
-      .eq("employee_id", id),
   ]);
 
   if (!employee) {
@@ -1396,15 +1617,22 @@ export default async function StaffDetailPage({
   }
 
   const [documentsPermission, photoPermission, permissionsPermission, managePermission] = await Promise.all([
-    authClient.rpc("has_permission", { p_permission_code: "viso.staff.documents.manage" }),
-    authClient.rpc("has_permission", { p_permission_code: "viso.staff.employee_photos.manage" }),
-    authClient.rpc("has_permission", { p_permission_code: "viso.staff.permissions.manage" }),
-    authClient.rpc("has_permission", { p_permission_code: "viso.staff.manage" }),
+    authClient.rpc("has_permission", { p_permission_code: "viso.staff.documents.manage", p_site_id: authorizedSiteId }),
+    authClient.rpc("has_permission", { p_permission_code: "viso.staff.employee_photos.manage", p_site_id: authorizedSiteId }),
+    authClient.rpc("has_permission", { p_permission_code: "viso.staff.permissions.manage", p_site_id: authorizedSiteId }),
+    authClient.rpc("has_permission", { p_permission_code: "viso.staff.manage", p_site_id: authorizedSiteId }),
   ]);
   const canEditDocuments = !documentsPermission.error && Boolean(documentsPermission.data);
   const canEditPhoto = !photoPermission.error && Boolean(photoPermission.data);
   const canManagePermissions = !permissionsPermission.error && Boolean(permissionsPermission.data);
   const canManageStaff = !managePermission.error && Boolean(managePermission.data);
+  const canReadGlobalEmployeePermissions = canManagePermissions &&
+    await requireStaffGlobalPermission(staffAccess, "staff.permissions.manage", true);
+  const { data: employeePermissionRows, error: employeePermissionError } = await supabase
+    .from("employee_permissions")
+    .select("id,is_allowed,scope_type,permission:app_permissions(id,code,name,app:apps(code))")
+    .eq("employee_id", id)
+    .or(employeePermissionScopeFilter(authorizedSiteId, canReadGlobalEmployeePermissions));
 
   const siteRows = (sites ?? []) as SiteRow[];
   const roleRows = (roles ?? []) as RoleRow[];
@@ -1576,7 +1804,9 @@ export default async function StaffDetailPage({
   const eligibilityResult = restResults[1] as { data?: unknown } | undefined;
   const documentTypesResult = restResults[2] as { data?: { id: string; name: string | null; requires_expiry: boolean | null; validity_months: number | null; allow_multiple: boolean | null }[] | null } | undefined;
   const availablePermissionsResult = restResults[3] as { data?: unknown[] | null } | undefined;
-  const employeePermissionsResult = restResults[4] as { data?: unknown[] | null } | undefined;
+  const employeePermissionsResult = {
+    data: employeePermissionError ? [] : employeePermissionRows,
+  } as { data?: unknown[] | null };
   const documentTypesForSelect = (documentTypesResult?.data ?? []) as { id: string; name: string | null; requires_expiry: boolean | null; validity_months: number | null; allow_multiple: boolean | null }[];
   type RawPermissionOption = {
     id: string;

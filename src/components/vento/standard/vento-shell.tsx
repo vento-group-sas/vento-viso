@@ -157,7 +157,7 @@ const ICON_NAMES = new Set<IconName>([
 
 const APP_SWITCHER_ITEMS: Omit<AppSwitcherItem, "access">[] = [
   { id: "shell", name: "Vento OS", description: "Launcher del ecosistema.", logoSrc: "/apps/hub.svg", brandColor: "#111827", href: "https://os.ventogroup.co", status: "active", group: "Workspace" },
-  { id: "anima", name: "ANIMA", description: "Jornadas y asistencia.", logoSrc: "/apps/anima.svg", brandColor: "#14B8A6", href: "https://anima.ventogroup.co", status: "active", group: "Workspace" },
+  { id: "anima", name: "ANIMA", description: "Jornadas y asistencia.", logoSrc: "/logos/anima.svg", brandColor: "#14B8A6", href: "https://anima.ventogroup.co", status: "active", group: "Workspace" },
   { id: "viso", name: "VISO", description: "Gerencia y auditoria.", logoSrc: "/apps/viso.svg", brandColor: "#A855F7", href: "https://viso.ventogroup.co", status: "active", group: "Operacion" },
   { id: "nexo", name: "NEXO", description: "Inventario y logistica.", logoSrc: "/apps/nexo.svg", brandColor: "#F59E0B", href: "https://nexo.ventogroup.co", status: "active", group: "Operacion" },
   { id: "fogo", name: "FOGO", description: "Recetas y produccion.", logoSrc: "/apps/fogo.svg", brandColor: "#FB7185", href: "https://fogo.ventogroup.co", status: "active", group: "Operacion" },
@@ -165,7 +165,7 @@ const APP_SWITCHER_ITEMS: Omit<AppSwitcherItem, "access">[] = [
   { id: "pulso", name: "PULSO", description: "POS y ventas.", logoSrc: "/apps/pulso.svg", brandColor: "#EF4444", href: "https://pulso.ventogroup.co", status: "active", group: "Operacion" },
   { id: "numera", name: "NUMERA", description: "Economia y rentabilidad.", logoSrc: "/apps/numera.svg", brandColor: "#2563EB", href: "https://numera.ventogroup.co", status: "active", group: "Operacion" },
   { id: "aura", name: "AURA", description: "Identidad canonica diferida.", logoSrc: "/apps/aura.svg", brandColor: "#A855F7", href: "", status: "soon", group: "Proximamente" },
-  { id: "pass", name: "Vento Pass", description: "Cliente sin destino web aprobado.", logoSrc: "/apps/pass.svg", brandColor: "#0F766E", href: "", status: "soon", group: "Proximamente" },
+  { id: "pass", name: "Vento Pass", description: "Cliente sin destino web aprobado.", logoSrc: "", brandColor: "#0F766E", href: "", status: "soon", group: "Proximamente" },
 ];
 
 function asId(value: unknown) {
