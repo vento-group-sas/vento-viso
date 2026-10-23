@@ -276,6 +276,23 @@ async function createSharedDeviceAction(
     };
   }
 
+  // El formulario permite personalizar apps. Validar cada codigo recibido
+  // contra el catalogo activo antes de crear un usuario tecnico con service_role.
+  const { data: activeApps, error: activeAppsError } = await admin
+    .from("apps")
+    .select("code")
+    .in("code", appCodes)
+    .eq("is_active", true);
+  const activeAppCodes = new Set(
+    (activeApps ?? []).map((app) => String(app.code ?? "").toLowerCase()),
+  );
+  if (activeAppsError || appCodes.some((appCode) => !activeAppCodes.has(appCode))) {
+    return {
+      status: "error",
+      message: "Las aplicaciones seleccionadas deben existir y estar activas en el catálogo.",
+    };
+  }
+
   const baseCode = code;
   let resolvedCode = "";
 

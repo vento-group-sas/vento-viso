@@ -1808,6 +1808,14 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
     {name:'invalid area',site:siteA,area:'not-an-area',allowed:true,reachAuth:false},
     {name:'invalid destination',site:'not-a-site',allowed:true,reachAuth:false},
     {name:'GLOBAL without catalog',site:siteB,allowed:true,global:'employee',catalog:false,reachAuth:false},
+    {name:'active extra application is allowed',site:siteA,allowed:true,
+      apps:['viso','origo'],enabledExtraApp:true,reachAuth:true},
+    {name:'inactive extra application is denied',site:siteA,allowed:true,
+      apps:['viso','origo'],reachAuth:false,invalidApp:true},
+    {name:'unknown application is denied',site:siteA,allowed:true,
+      apps:['viso','ghost-app'],reachAuth:false,invalidApp:true},
+    {name:'catalog query error fails closed',site:siteA,allowed:true,
+      catalogError:true,reachAuth:false,invalidApp:true},
   ];
   for (const scenario of cases) {
     let authCreates = 0;
@@ -1819,6 +1827,7 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
         const query = {
           select() { return query; },
           eq(column, value) { filters[column] = value; return query; },
+          in(column, values) { filters[column] = Array.from(values); return query; },
           is(column, value) { filters[column] = value; return query; },
           or() { return query; },
           limit() { return query; },
@@ -1859,6 +1868,14 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
             return {data,error:null};
           },
           then(resolve, reject) {
+            if (table === 'apps') {
+              assert.equal(filters.is_active, true);
+              const active = scenario.enabledExtraApp ? ['viso','origo'] : ['viso'];
+              const data = active.filter((code) => filters.code.includes(code))
+                .map((code) => ({code}));
+              return Promise.resolve({data,error:scenario.catalogError
+                ? {message:'QA_INJECTED_CATALOG_ERROR'} : null}).then(resolve,reject);
+            }
             if (table !== 'shared_operational_device_template_apps') {
               return Promise.reject(new Error('Unexpected query list: ' + table))
                 .then(resolve, reject);
@@ -1902,14 +1919,18 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
     form.set('label','QA controlled nonpersistent device');
     form.set('site_id',scenario.site);
     if (scenario.area) form.set('area_id',scenario.area);
-    form.append('app_codes','viso');
+    for (const appCode of scenario.apps ?? ['viso']) {
+      form.append('app_codes',appCode);
+    }
     form.set('default_app_code','viso');
     const result = await action({status:'idle'},form);
     assert.equal(result.status,'error',scenario.name);
     assert.equal(authCreates,Number(scenario.reachAuth),scenario.name);
     assert.equal(insertAttempts,0,scenario.name);
-    assert.match(result.message,scenario.reachAuth
-      ? /QA_STOP_BEFORE_AUTH_MUTATION/u : /No tienes autorización/u,scenario.name);
+    assert.match(result.message,scenario.invalidApp
+      ? /aplicaciones seleccionadas deben existir y estar activas/u
+      : scenario.reachAuth
+        ? /QA_STOP_BEFORE_AUTH_MUTATION/u : /No tienes autorización/u,scenario.name);
     if (scenario.site === siteB && !scenario.allowed) {
       assert.equal(lookups.some(item => item.table === 'shared_operational_device_templates'),
         false,scenario.name);
@@ -1942,6 +1963,7 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
         const query = {
           select() { return query; },
           eq(column,value) { filters[column] = value; return query; },
+          in(column,values) { filters[column] = Array.from(values); return query; },
           order() { return query; },
           async maybeSingle() {
             if (table === 'employee_sites') {
@@ -1958,6 +1980,12 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
             assert.fail('Unexpected lookup in device audit test: ' + table);
           },
           then(resolve,reject) {
+            if (table === 'apps') {
+              assert.equal(filters.is_active,true);
+              assert.deepEqual(filters.code,['viso']);
+              return Promise.resolve({data:[{code:'viso'}],error:null})
+                .then(resolve,reject);
+            }
             assert.equal(table,'shared_operational_device_template_apps');
             return Promise.resolve({data:[{app_code:'viso',is_default:true,is_active:true}],error:null})
               .then(resolve,reject);
