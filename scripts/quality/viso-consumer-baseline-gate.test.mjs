@@ -333,6 +333,8 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
     { name: 'GLOBAL with effective B denial', grant: 'employee', denyB: true, expected: [a] },
     { name: 'Missing catalog must not promote access', grant: 'employee', noCatalog: true, expected: [a] },
     { name: 'Shared device is always SITE scoped', grant: 'role', shared: true, expected: [a] },
+    { name: 'SITE reader without staff.manage cannot list devices', grant: 'none',
+      manageOwn:false, expected:[a] },
   ];
   for (const scenario of cases) {
     const queries = [];
@@ -341,6 +343,16 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
       employees: workers,
       sites: [{ id: a, name: 'QA A' }, { id: b, name: 'QA B' }],
       shared_operational_devices_admin_v1: [{ id: 'device-b' }],
+      shared_operational_devices: [
+        {id:'device-a',code:'GAP004_SITE_A_DEVICE',label:'GAP004_SITE_A_DEVICE',
+          device_type:'tablet',site_id:a,activation_status:'active',is_active:true,
+          default_app_code:'viso',site:{name:'QA A',code:'A'},area:null,
+          allowed_apps:[{app_code:'viso',is_active:true}]},
+        {id:'device-b',code:'GAP004_SITE_B_DEVICE',label:'GAP004_SITE_B_DEVICE',
+          device_type:'tablet',site_id:b,activation_status:'active',is_active:true,
+          default_app_code:'viso',site:{name:'QA B',code:'B'},area:null,
+          allowed_apps:[{app_code:'viso',is_active:true}]},
+      ],
     };
     const admin = {
       async rpc(name) {
@@ -396,6 +408,11 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
                 member.active && filters['employee_sites.site_id'].includes(member.id)));
             } else if (table === 'sites' && filters.id) {
               values = tables.sites.filter((site) => filters.id.includes(site.id));
+            } else if (table === 'shared_operational_devices') {
+              assert.equal(filters.site_id,a,
+                'SITE devices must be scoped in PostgREST, not only filtered in the UI');
+              values = tables.shared_operational_devices.filter((row) =>
+                row.site_id === filters.site_id);
             }
             return Promise.resolve({ data: values, error: null }).then(resolve, reject);
           },
@@ -406,8 +423,12 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
     const authClient = {
       async rpc(name, args) {
         assert.equal(name, 'has_permission');
-        assert.equal(args.p_permission_code, 'viso.workforce.employees.view');
         assert.equal(args.p_area_id, null);
+        if(args.p_permission_code === 'viso.staff.manage') {
+          assert.equal(args.p_site_id,a);
+          return {data:scenario.manageOwn !== false && !scenario.shared,error:null};
+        }
+        assert.equal(args.p_permission_code, 'viso.workforce.employees.view');
         rpcCalls.push(args.p_site_id);
         return { data: args.p_site_id !== b || scenario.denyB !== true, error: null };
       },
@@ -430,17 +451,25 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
     assert.deepEqual([...scope.authorizedSiteIds], scenario.expected, scenario.name);
     const canReadAll = scenario.expected.length === 2 && scenario.grant !== 'none';
     assert.equal(scope.canReadAllSites, canReadAll, scenario.name);
+    const canManageOwn = scenario.manageOwn !== false && !scenario.shared;
+    assert.equal(scope.deviceSiteId,canManageOwn ? a : null,scenario.name);
     const [{ data: employees }, { data: sites }, { data: devices }] =
       await scopeFunctions.readScopedStaffIndex(
-        scope.supabase, scope.authorizedSiteIds, scope.canReadAllSites);
+        scope.supabase, scope.authorizedSiteIds, scope.canReadAllSites,
+        scope.deviceSiteId);
     const expectedIds = canReadAll
       ? ['employee-a', 'employee-b', 'employee-multi']
       : ['employee-a', 'employee-multi'];
     assert.deepEqual([...employees].map((v) => v.id), expectedIds, scenario.name);
     assert.deepEqual([...sites].map((v) => v.id), scenario.expected, scenario.name);
-    assert.equal(devices.length, canReadAll ? 1 : 0, scenario.name);
+    assert.equal(devices.length, canReadAll ? 1 : canManageOwn ? 1 : 0, scenario.name);
     assert.equal(queries.some((query) => query.table === 'shared_operational_devices_admin_v1'),
       canReadAll, scenario.name);
+    assert.equal(queries.some((query) => query.table === 'shared_operational_devices'),
+      !canReadAll && canManageOwn, scenario.name);
+    if(!canReadAll && canManageOwn) {
+      assert.equal(devices[0].site_id,a,'SITE A must never receive SITE B device');
+    }
     if (scenario.shared) assert.equal(rpcCalls.length, 0, scenario.name);
     else assert.ok(rpcCalls.includes(null), 'Null-site RPC must not prove GLOBAL: ' + scenario.name);
     for (const query of queries.filter((item) => item.table === 'employees')) {
@@ -501,6 +530,14 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
       assert.doesNotMatch(renderedHtml,
         /GAP004_SITE_B_FOREIGN_SENTINEL|href="\/staff\/employee-b"/u, scenario.name);
     }
+    if (!canReadAll && canManageOwn) {
+      const deviceHtml=renderToStaticMarkup(await pageModule.exports.default({
+        searchParams:Promise.resolve({tab:'devices',status:'all'}),
+      }));
+      assert.match(deviceHtml,/GAP004_SITE_A_DEVICE/u);
+      assert.doesNotMatch(deviceHtml,/GAP004_SITE_B_DEVICE/u);
+      assert.match(deviceHtml,/Confirmar revocación/u);
+    }
   }
 
   // Fail closed before the admin client is created for a forged site.
@@ -545,8 +582,8 @@ test('GAP-PKG-004 /staff enforces SITE/GLOBAL on actual server query boundaries'
   assert.match(source, /\.in\("site_id", authorizedSiteIds\)\s*\.eq\("is_active", true\)/u);
   assert.match(source, /\.in\("last_site_id", authorizedSiteIds\)/u);
   assert.match(source, /const eligibilityQuery = canReadAllSites/u);
-  assert.match(source, /resolvedSearchParams\.tab === "devices" && canReadAllSites/u);
-  assert.match(source, /canReadAllSites \? \[\{ value: "devices"/u);
+  assert.match(source, /resolvedSearchParams\.tab === "devices" && canViewDevices/u);
+  assert.match(source, /canViewDevices \? \[\{ value: "devices"/u);
 });
 
 // GAP-PKG-004: execute the real VISO server-side territorial guard with
@@ -1641,7 +1678,178 @@ async function verifyStaffNominalHttp({
       assert.equal(deviceLogin.user?.id,stored.data.auth_user_id);
       assert.equal(deviceLogin.user?.app_metadata?.account_type,
         'shared_operational_device');
+
+      // Repeat the exact same request against real Auth/Postgres. The current
+      // action must at least reject it without a second account or device.
+      // This does NOT establish idempotency: a correct replay response with
+      // the original outcome remains a separate requirement.
+      const repeated = await action({status:'idle'},makeForm(ids.siteA,'viso'));
+      assert.equal(repeated.status,'error',
+        'Identical replay must not silently provision another technical account');
+      const afterReplay = deviceSnapshot();
+      assert.equal(afterReplay.technical_auth,1);
+      assert.equal(afterReplay.devices,1);
+      assert.equal(afterReplay.device_apps,1);
+      assert.equal(afterReplay.device_events,1);
+      console.log('GAP004_DEVICE_REPLAY_NO_DUPLICATE_PASS_IDEMPOTENCY_PENDING');
+
+      // Exercise actual Next HTTP access using the same genuine QA user JWT.
+      // All requests below are GET only; the server action has already been
+      // tested through the authorized synthetic harness.
+      const deviceCookieJar = new Map();
+      const deviceCookieClient = createServerClient(origin,anonKey,{
+        cookies:{
+          getAll(){ return [...deviceCookieJar].map(([name,value])=>({name,value})); },
+          setAll(items){ for(const item of items) {
+            if(item.value) deviceCookieJar.set(item.name,item.value);
+            else deviceCookieJar.delete(item.name);
+          } },
+        },
+      });
+      const {data:browserLogin,error:browserLoginError} =
+        await deviceCookieClient.auth.signInWithPassword({
+          email:deviceEmail,password:createdDevice.device.temporaryPassword,
+        });
+      assert.equal(browserLoginError,null,'Synthetic device SSR session must authenticate');
+      assert.equal(browserLogin.user?.id,stored.data.auth_user_id);
+      let deviceCookieHeader = [...deviceCookieJar].map(([name,value])=>
+        name+'='+encodeURIComponent(value)).join('; ');
+      assert.match(deviceCookieHeader,/sb-[a-z0-9-]+-auth-token/iu);
+      const readDeviceHome = async() => {
+        const response = await fetch(appOrigin+'/',{
+          method:'GET',redirect:'manual',
+          headers:{cookie:deviceCookieHeader},
+          signal:AbortSignal.timeout(30000),
+        });
+        return {status:response.status,
+          location:response.headers.get('location')??'',
+          html:await response.text()};
+      };
+      const activeHome = await readDeviceHome();
+      assert.equal(activeHome.status,200,
+        'An active VISO-authorized technical session must load the home route');
+      assert.match(activeHome.html,/Panel VISO/u);
+
+      // Execute the production lifecycle Server Action, not a SQL shortcut.
+      // Keep Next's redirect boundary explicit without creating a browser POST.
+      const lifecycleSource = fs.readFileSync(
+        new URL('../../src/app/staff/page.tsx', import.meta.url),'utf8');
+      const lifecycleStart = lifecycleSource.indexOf(
+        'async function changeSharedDeviceState(');
+      const lifecycleEnd = lifecycleSource.indexOf(
+        '\n// Authorize before using the service-role client.', lifecycleStart);
+      assert.ok(lifecycleStart > 0 && lifecycleEnd > lifecycleStart);
+      const lifecycleAction = runInNewContext(
+        stripTypeScriptTypes(lifecycleSource.slice(lifecycleStart,lifecycleEnd))+
+          '\nchangeSharedDeviceState',{
+          isUuid:(value)=>/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu.test(value),
+          requireAppAccess:async({appId,permissionCode})=>{
+            assert.equal(appId,'viso');
+            assert.equal(permissionCode,'staff.manage');
+            const {data:current,error:identityError}=await cookieClient.auth.getUser();
+            assert.equal(identityError,null);
+            assert.equal(current.user?.id,ids.actor);
+            return {user:current.user,siteId:ids.siteA,
+              operationalSession:{isSharedDevice:false,role:'cajero'},
+              supabase:cookieClient};
+          },
+          createAdminClient:()=>service,
+          deviceNotice:(notice)=>{throw new Error('GAP004_DEVICE_NOTICE:'+notice)},
+          FormData,Date,Promise,
+        },{timeout:5000});
+      const transition=async(kind,{confirmed=true}={})=>{
+        const form=new FormData();
+        form.set('device_id',createdDevice.device.id);
+        form.set('transition',kind);
+        if(confirmed) form.set('confirm_revocation','yes');
+        try {
+          await lifecycleAction(form);
+          assert.fail('Lifecycle action must report its result by controlled redirect');
+        }catch(error){
+          assert.match(error.message,/^GAP004_DEVICE_NOTICE:/u);
+          return error.message.slice('GAP004_DEVICE_NOTICE:'.length);
+        }
+      };
+      const assertDeniedWithOldJwt=async(activationStatus)=>{
+        const deniedHome=await readDeviceHome();
+        const deniedRedirect=deniedHome.status>=300 && deniedHome.status<400 &&
+          /^\/(?:no-access|login)(?:\?|\/|$)/u.test(deniedHome.location);
+        const deniedStream=deniedHome.status===200 &&
+          /(?:no-access|login)/u.test(deniedHome.html) &&
+          /NEXT_REDIRECT|http-equiv=["']refresh/iu.test(deniedHome.html);
+        assert.equal(deniedRedirect||deniedStream,true,
+          'Previously valid JWT must be rejected after '+activationStatus+
+          '; HTTP='+deniedHome.status);
+        assert.doesNotMatch(deniedHome.html,/Panel VISO/u);
+      };
+      const inspectDevice=async(expected,active)=>{
+        const {data:row,error}=await service.from('shared_operational_devices')
+          .select('activation_status,is_active').eq('id',stored.data.id).single();
+        assert.equal(error,null);
+        assert.equal(row?.activation_status,expected);
+        assert.equal(row?.is_active,active);
+      };
+      const freshTechnicalLogin=async()=>{
+        const client=createClient(origin,anonKey,{
+          auth:{persistSession:false,autoRefreshToken:false}});
+        const outcome=await client.auth.signInWithPassword({
+          email:deviceEmail,password:createdDevice.device.temporaryPassword});
+        if(!outcome.error) await client.auth.signOut();
+        return outcome;
+      };
+      assert.equal(await transition('suspend'),'updated');
+      await inspectDevice('suspended',false);
+      await assertDeniedWithOldJwt('suspended');
+      const blockedLogin=await freshTechnicalLogin();
+      assert.ok(blockedLogin.error,'Suspended account must reject new sign-in');
+      assert.equal(await transition('suspend'),'unchanged',
+        'Repeated suspension must not insert another audit event');
+
+      assert.equal(await transition('reactivate'),'updated');
+      await inspectDevice('active',true);
+      const renewedLogin=await freshTechnicalLogin();
+      assert.equal(renewedLogin.error,null,'Reactivated account can sign in');
+      await assertDeniedWithOldJwt('reactivated account with previously banned JWT');
+      const {data:newBrowserSession,error:newBrowserError} =
+        await deviceCookieClient.auth.signInWithPassword({
+          email:deviceEmail,password:createdDevice.device.temporaryPassword,
+        });
+      assert.equal(newBrowserError,null,'Reactivation must establish a new session');
+      assert.equal(newBrowserSession.user?.id,stored.data.auth_user_id);
+      deviceCookieHeader=[...deviceCookieJar].map(([name,value])=>
+        name+'='+encodeURIComponent(value)).join('; ');
+      const resumedHome=await readDeviceHome();
+      assert.equal(resumedHome.status,200);
+      assert.match(resumedHome.html,/Panel VISO/u);
+      assert.equal(await transition('reactivate'),'unchanged',
+        'Repeat activation must not create a fictitious audit event');
+
+      assert.equal(await transition('revoke',{confirmed:false}),'denied',
+        'Revocation requires an explicit confirmation checkbox');
+      await inspectDevice('active',true);
+      assert.equal(await transition('revoke'),'updated');
+      await inspectDevice('revoked',false);
+      await assertDeniedWithOldJwt('revoked');
+      const permanentlyBlocked=await freshTechnicalLogin();
+      assert.ok(permanentlyBlocked.error,'Revoked account rejects new sign-in');
+      assert.equal(await transition('revoke'),'unchanged');
+      assert.equal(await transition('reactivate'),'conflict',
+        'Revoked devices must not be reactivated');
+
+      const {data:lifecycleEvents,error:eventsError}=await service
+        .from('shared_operational_device_events')
+        .select('event_type,actor_employee_id,source')
+        .eq('device_id',stored.data.id).order('occurred_at',{ascending:true});
+      assert.equal(eventsError,null);
+      assert.deepEqual(lifecycleEvents?.map(event=>event.event_type),[
+        'device.created','device.suspended','device.activated','device.revoked']);
+      assert.ok(lifecycleEvents?.every(event=>event.actor_employee_id===ids.actor
+        && event.source==='admin'));
+      assert.equal(deviceSnapshot().device_events,4);
+      await deviceCookieClient.auth.signOut();
       await deviceLoginClient.auth.signOut();
+      console.log('GAP004_REAL_DEVICE_LIFECYCLE_AUTH_DB_AUDIT_PASS');
+      console.log('GAP004_REAL_DEVICE_SUSPENDED_REVOKED_JWT_HTTP_DENIED_PASS');
       deviceProvisioned=true;
     } finally {
       // Each row is owned by a nonce or UUID from this isolated QA invocation.
