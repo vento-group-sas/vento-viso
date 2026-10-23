@@ -1557,6 +1557,20 @@ async function verifyStaffNominalHttp({
     const initialDeviceState = deviceSnapshot();
     assert.ok(Object.values(initialDeviceState).every(count => count === 0),
       'Real-device QA fixture must be absent before starting');
+    const postCode = 'GAP004_FORM_' + nonce.slice(0, 19).toUpperCase();
+    const postEmail = 'gap004-form-' + nonce + '@example.invalid';
+    const postSnapshot = () => JSON.parse(db([
+      'SELECT json_build_object(',
+      " 'technical_auth',(SELECT count(*) FROM auth.users WHERE email='" + postEmail + "'),",
+      " 'technical_profile',(SELECT count(*) FROM public.users WHERE email='" + postEmail + "'),",
+      " 'devices',(SELECT count(*) FROM public.shared_operational_devices WHERE code='" + postCode + "'),",
+      " 'device_apps',(SELECT count(*) FROM public.shared_operational_device_apps WHERE device_id IN (SELECT id FROM public.shared_operational_devices WHERE code='" + postCode + "')),",
+      " 'device_events',(SELECT count(*) FROM public.shared_operational_device_events WHERE event_payload->>'code'='" + postCode + "')",
+      ');',
+    ].join('\n')));
+    const initialPostState = postSnapshot();
+    assert.ok(Object.values(initialPostState).every(count => count === 0),
+      'Native POST synthetic fixture must not exist before execution');
     let setupStarted = false;
     let deviceProvisioned = false;
     try {
@@ -1585,6 +1599,155 @@ async function verifyStaffNominalHttp({
       assert.equal(permission.error, null);
       assert.equal(permission.data, true,
         'Real JWT must authorize creating a device in SITE A');
+
+      // Verificar el formulario REAL renderizado por Next (no el action aislado).
+      // La cuenta, plantilla y sede son exclusivamente del QA descartable.
+      const browserFormPage = await fetch(appOrigin + '/staff/shared-devices/new', {
+        method: 'GET', redirect: 'manual', headers: { cookie: cookieHeader },
+        signal: AbortSignal.timeout(30000),
+      });
+      assert.equal(browserFormPage.status, 200,
+        'Synthetic SITE administrator must open real device form via HTTP');
+      const browserFormHtml = await browserFormPage.text();
+      assert.match(browserFormHtml, /Nombre visible/u);
+      assert.match(browserFormHtml, /name="template_id"/u);
+      assert.match(browserFormHtml, /name="site_id"/u);
+      assert.match(browserFormHtml,
+        /Si el código ya existe, no se creará otro dispositivo/u);
+      assert.doesNotMatch(browserFormHtml, /sufijo automático como _02/u);
+      const actionFields = [...browserFormHtml.matchAll(/name="(\$ACTION_[^"]+)"/gu)]
+        .map(match => match[1]);
+      assert.ok(actionFields.length > 0,
+        'Next must expose native form action metadata for progressive submission');
+      console.log('GAP004_DEVICE_REAL_NEXT_FORM_GET_READY');
+
+      // Enviar el HTML nativo del formulario por HTTP POST al Next real,
+      // no llamar directamente a createSharedDeviceAction ni a PostgREST.
+      // No se registra el payload firmado ni la respuesta con contraseña.
+      const formMarker = browserFormHtml.indexOf('name="template_id"');
+      const formStart = browserFormHtml.lastIndexOf('<form', formMarker);
+      const formEnd = browserFormHtml.indexOf('</form>', formMarker);
+      assert.ok(formMarker > 0 && formStart >= 0 && formEnd > formMarker,
+        'Real native device form must exist in the authorized page');
+      const nativeFormHtml = browserFormHtml.slice(formStart, formEnd + 7);
+      const htmlAttributeValue = (value) => String(value)
+        .replace(/&quot;/gu, '"').replace(/&#(?:x27|39);/giu, "'")
+        .replace(/&lt;/gu, '<').replace(/&gt;/gu, '>')
+        .replace(/&amp;/gu, '&');
+      const nativeActionPairs = [...nativeFormHtml.matchAll(/<input\b[^>]*>/gu)]
+        .map(([tag]) => {
+          const name = tag.match(/\bname="([^"]+)"/u)?.[1];
+          if (!name?.startsWith('$ACTION_')) return null;
+          const value = tag.match(/\bvalue="([^"]*)"/u)?.[1] ?? '';
+          return [name, htmlAttributeValue(value)];
+        }).filter(Boolean);
+      assert.ok(nativeActionPairs.length > 0,
+        'Native POST must include React action metadata extracted from real HTML');
+      const nativePayload = new URLSearchParams(nativeActionPairs);
+      nativePayload.set('template_id', templateId);
+      nativePayload.set('label', 'GAP004 QA native form ' + nonce.slice(0, 12));
+      nativePayload.set('code', postCode);
+      nativePayload.set('site_id', ids.siteA);
+      nativePayload.set('login_email', postEmail);
+      nativePayload.append('app_codes', 'viso');
+      nativePayload.set('default_app_code', 'viso');
+      nativePayload.set('requires_actor_pin', 'on');
+      nativePayload.set('requires_active_actor_shift', 'on');
+      const postNativeForm = async ({withAuth=true} = {}) => {
+        const headers = {
+          origin: appOrigin,
+          referer: appOrigin + '/staff/shared-devices/new',
+        };
+        if (withAuth) headers.cookie = cookieHeader;
+        const browserBody = new FormData();
+        for (const [name, value] of nativePayload.entries()) {
+          browserBody.append(name, value);
+        }
+        const res = await fetch(appOrigin + '/staff/shared-devices/new', {
+          method: 'POST', redirect: 'manual', headers,
+          body: browserBody,
+          signal: AbortSignal.timeout(30000),
+        });
+        return {status:res.status,location:res.headers.get('location') ?? '',
+          contentType:res.headers.get('content-type') ?? '',
+          body:await res.text()};
+      };
+      const unauthenticatedPost = await postNativeForm({withAuth:false});
+      assert.ok(unauthenticatedPost.status < 500,
+        'Native POST without authenticated operator must fail closed');
+      assert.deepEqual(postSnapshot(), initialPostState,
+        'Anonymous native POST must not create Auth/DB device resources');
+      assert.doesNotMatch(unauthenticatedPost.body,
+        /Dispositivo compartido creado y activado/u,
+        'Unauthenticated POST must not render a device-created success notice');
+      const positivePost = await postNativeForm();
+      assert.ok(positivePost.status >= 200 && positivePost.status < 400,
+        'Authorized native HTTP POST must return controlled response: HTTP ' + positivePost.status);
+      const postSaved = postSnapshot();
+      if (postSaved.technical_auth !== 1) {
+        // Diagnostic classification only; never emit Auth cookies, action
+        // payloads, page HTML, passwords, or raw server error bodies.
+        const locationPath = positivePost.location
+          ? new URL(positivePost.location, appOrigin).pathname : 'NO_REDIRECT';
+        const knownMarkers = [
+          ['ACCESS_DENIED', /No tienes autorizaci[oó]n|no-access/iu],
+          ['LOGIN', /login|Iniciar sesi[oó]n/iu],
+          ['DUPLICATE', /Ya existe un dispositivo/iu],
+          ['TEMPLATE', /Selecciona una plantilla|plantilla.*inactiva/iu],
+          ['PERMISSION', /staff\.manage|has_permission/iu],
+          ['RECONCILE', /conciliaci[oó]n administrativa/iu],
+          ['ACTION_FAILURE', /Server Action|Failed to find Server Action|NEXT_REDIRECT/iu],
+          ['VALIDATION', /No se pudo|No pudieron|aplicaciones seleccionadas/iu],
+        ].filter(([,pattern])=>pattern.test(positivePost.body))
+         .map(([code])=>code);
+        console.log('GAP004_NATIVE_POST_SAFE_DIAGNOSTIC ' + JSON.stringify({
+          status:positivePost.status,
+          content_type_class:positivePost.contentType.split(';')[0],
+          location_path:locationPath,
+          response_length:positivePost.body.length,
+          action_input_count:nativeActionPairs.length,
+          native_method:nativeFormHtml.match(/<form[^>]+method="([^"]+)"/iu)?.[1] ?? 'NONE',
+          native_enctype:nativeFormHtml.match(/<form[^>]+(?:encType|enctype)="([^"]+)"/iu)?.[1] ?? 'NONE',
+          form_has_javascript_action:/<form[^>]+action="javascript:/iu.test(nativeFormHtml),
+          response_contains_creation_form:/name="template_id"/u.test(positivePost.body),
+          response_contains_login_form:/name="password"/u.test(positivePost.body),
+          response_contains_success:/Dispositivo compartido creado y activado/u.test(positivePost.body),
+          marker_codes:knownMarkers,
+        }));
+      }
+      assert.equal(postSaved.technical_auth, 1,
+        'Real Next POST must provision exactly one technical GoTrue account');
+      assert.equal(postSaved.devices, 1, 'Real Next POST must persist one device');
+      assert.equal(postSaved.device_apps, 1, 'Real Next POST must persist its application');
+      assert.equal(postSaved.device_events, 1, 'Real Next POST must record its audit event');
+      assert.match(positivePost.body, /Dispositivo compartido creado y activado/u,
+        'Native POST must show business success in its rendered response');
+      const {data:postDevice,error:postDeviceError} = await service
+        .from('shared_operational_devices')
+        .select('id,auth_user_id,site_id,activation_status,is_active')
+        .eq('code',postCode).single();
+      assert.equal(postDeviceError,null);
+      assert.equal(postDevice.site_id,ids.siteA);
+      assert.equal(postDevice.activation_status,'active');
+      assert.equal(postDevice.is_active,true);
+      const {data:postEvent,error:postEventError} = await service
+        .from('shared_operational_device_events')
+        .select('event_type,actor_employee_id,source,session_user_id')
+        .eq('device_id',postDevice.id).single();
+      assert.equal(postEventError,null);
+      assert.equal(postEvent.event_type,'device.created');
+      assert.equal(postEvent.actor_employee_id,ids.actor);
+      assert.equal(postEvent.session_user_id,postDevice.auth_user_id);
+      assert.equal(postEvent.source,'admin');
+      console.log('GAP004_NEXT_NATIVE_FORM_HTTP_POST_AUTH_DB_AUDIT_PASS');
+      const replayPost = await postNativeForm();
+      assert.ok(replayPost.status >= 200 && replayPost.status < 400,
+        'Duplicate native POST must yield controlled response');
+      assert.deepEqual(postSnapshot(),postSaved,
+        'Replaying identical native POST must not duplicate Auth, device or audit');
+      assert.match(replayPost.body,/Ya existe un dispositivo con ese código/u,
+        'Duplicate native POST must show actionable controlled feedback');
+      console.log('GAP004_NEXT_NATIVE_FORM_HTTP_POST_REPLAY_NO_DUPLICATE_PASS');
 
       const source = fs.readFileSync(
         new URL('../../src/app/staff/shared-devices/new/page.tsx', import.meta.url),
@@ -1863,30 +2026,32 @@ async function verifyStaffNominalHttp({
       // Each row is owned by a nonce or UUID from this isolated QA invocation.
       // Remove event rows before device/employee rows (events have SET NULL FKs).
       const cleanupFailures=[];
+      const ownedCodes = "'" + deviceCode + "','" + postCode + "'";
+      const ownedEmails = "'" + deviceEmail + "','" + postEmail + "'";
       if (setupStarted) {
         try {
           db([
             'BEGIN;',
             "SET LOCAL statement_timeout='15s';",
             'DELETE FROM public.shared_operational_device_events WHERE',
-            " event_payload->>'code'='" + deviceCode + "' AND source='admin';",
+            " event_payload->>'code' IN (" + ownedCodes + ") AND source='admin';",
             'DELETE FROM public.shared_operational_device_actor_policies',
             'WHERE device_id IN (SELECT id FROM public.shared_operational_devices',
-            " WHERE code='" + deviceCode + "');",
+            " WHERE code IN (" + ownedCodes + "));",
             'DELETE FROM public.shared_operational_device_apps',
             'WHERE device_id IN (SELECT id FROM public.shared_operational_devices',
-            " WHERE code='" + deviceCode + "');",
-            "DELETE FROM public.shared_operational_devices WHERE code='" + deviceCode + "';",
+            " WHERE code IN (" + ownedCodes + "));",
+            "DELETE FROM public.shared_operational_devices WHERE code IN (" + ownedCodes + ");",
             'DELETE FROM public.shared_operational_device_template_apps WHERE template_id=' + deviceUuid(templateId) + ';',
             'DELETE FROM public.shared_operational_device_templates WHERE id=' + deviceUuid(templateId) + ';',
             'DELETE FROM public.employee_permissions WHERE id=' + deviceUuid(deviceGrantId) + ';',
-            "DELETE FROM public.users WHERE email='" + deviceEmail + "' AND id IN (SELECT id FROM auth.users WHERE email='" + deviceEmail + "');",
+            "DELETE FROM public.users WHERE email IN (" + ownedEmails + ") AND id IN (SELECT id FROM auth.users WHERE email IN (" + ownedEmails + "));",
             'COMMIT;',
           ].join('\n'));
         } catch { cleanupFailures.push('DEVICE_DB_CLEANUP'); }
       }
       try {
-        const technicalIds = db("SELECT id FROM auth.users WHERE email='" + deviceEmail + "';");
+        const technicalIds = db("SELECT id FROM auth.users WHERE email IN (" + ownedEmails + ");");
         for (const technicalId of technicalIds.split('\n').filter(Boolean)) {
           assert.match(technicalId,/^[0-9a-f-]{36}$/iu);
           const {error} = await service.auth.admin.deleteUser(technicalId);
@@ -1894,8 +2059,9 @@ async function verifyStaffNominalHttp({
         }
       } catch { cleanupFailures.push('DEVICE_AUTH_CLEANUP'); }
       try {
-        db("DELETE FROM public.users WHERE email='" + deviceEmail + "' AND NOT EXISTS (SELECT 1 FROM auth.users WHERE id=public.users.id);");
+        db("DELETE FROM public.users WHERE email IN (" + ownedEmails + ") AND NOT EXISTS (SELECT 1 FROM auth.users WHERE id=public.users.id);");
         assert.deepEqual(deviceSnapshot(),initialDeviceState);
+        assert.deepEqual(postSnapshot(),initialPostState);
       } catch { cleanupFailures.push('DEVICE_RESIDUALS'); }
       assert.deepEqual(cleanupFailures,[],
         'Isolated real Auth/DB device integration must leave zero residue');
