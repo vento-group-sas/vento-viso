@@ -1691,6 +1691,14 @@ async function verifyStaffNominalHttp({
       assert.equal(afterReplay.devices,1);
       assert.equal(afterReplay.device_apps,1);
       assert.equal(afterReplay.device_events,1);
+      const replayWithoutEmail = makeForm(ids.siteA,'viso');
+      replayWithoutEmail.delete('login_email');
+      const repeatedAutoEmail = await action({status:'idle'},replayWithoutEmail);
+      assert.equal(repeatedAutoEmail.status,'error',
+        'Submitting again without technical email must not append _02 and create a device');
+      assert.match(repeatedAutoEmail.message,/Ya existe un dispositivo con ese código/u);
+      assert.deepEqual(deviceSnapshot(),afterReplay,
+        'Unchanged device code must not create another identity after re-submit');
       console.log('GAP004_DEVICE_REPLAY_NO_DUPLICATE_PASS_IDEMPOTENCY_PENDING');
 
       // Exercise actual Next HTTP access using the same genuine QA user JWT.
@@ -2239,6 +2247,8 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
     {name:'invalid area',site:siteA,area:'not-an-area',allowed:true,reachAuth:false},
     {name:'invalid destination',site:'not-a-site',allowed:true,reachAuth:false},
     {name:'GLOBAL without catalog',site:siteB,allowed:true,global:'employee',catalog:false,reachAuth:false},
+    {name:'identical device code already exists',site:siteA,allowed:true,
+      existingCode:true,reachAuth:false},
     {name:'active extra application is allowed',site:siteA,allowed:true,
       apps:['viso','origo'],enabledExtraApp:true,reachAuth:true},
     {name:'inactive extra application is denied',site:siteA,allowed:true,
@@ -2292,7 +2302,7 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
               data = {id:'synthetic-template',code:'QA_ONLY',device_type:'tablet',
                 default_app_code:'viso',is_active:true};
             } else if (table === 'shared_operational_devices') {
-              data = null;
+              data = scenario.existingCode ? {id:'device-existing'} : null;
             } else {
               assert.fail('Unexpected privileged table lookup: ' + table);
             }
@@ -2360,8 +2370,10 @@ test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provis
     assert.equal(insertAttempts,0,scenario.name);
     assert.match(result.message,scenario.invalidApp
       ? /aplicaciones seleccionadas deben existir y estar activas/u
-      : scenario.reachAuth
-        ? /QA_STOP_BEFORE_AUTH_MUTATION/u : /No tienes autorización/u,scenario.name);
+      : scenario.existingCode
+        ? /Ya existe un dispositivo con ese código/u
+        : scenario.reachAuth
+          ? /QA_STOP_BEFORE_AUTH_MUTATION/u : /No tienes autorización/u,scenario.name);
     if (scenario.site === siteB && !scenario.allowed) {
       assert.equal(lookups.some(item => item.table === 'shared_operational_device_templates'),
         false,scenario.name);
@@ -2386,6 +2398,12 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
     {name:'audit SQL error',kind:'error'},
     {name:'audit network throw',kind:'throw'},
     {name:'audit and cleanup failure',kind:'error',cleanupFails:true},
+    {name:'device insert SQL error',kind:'device_error'},
+    {name:'device insert lost network response',kind:'device_throw'},
+    {name:'application association SQL error',kind:'apps_error'},
+    {name:'application association network throw',kind:'apps_throw'},
+    {name:'template policies SQL error',kind:'policies_error'},
+    {name:'template policies network throw',kind:'policies_throw'},
   ]) {
     const calls = [];
     const admin = {
@@ -2407,7 +2425,14 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
               return {data:{id:'qa-template',code:'QA_ONLY',device_type:'tablet',
                 default_app_code:'viso',is_active:true},error:null};
             }
-            if (table === 'shared_operational_devices') return {data:null,error:null};
+            if (table === 'shared_operational_devices') {
+              if (filters.auth_user_id === deviceUserId) {
+                calls.push('device_lookup');
+                return {data:scenario.kind==='device_throw'
+                  ? {id:deviceId}:null,error:null};
+              }
+              return {data:null,error:null};
+            }
             assert.fail('Unexpected lookup in device audit test: ' + table);
           },
           then(resolve,reject) {
@@ -2426,13 +2451,22 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
               assert.equal(values.activation_status,'active');
               assert.equal(values.site_id,site);
               calls.push('device_create');
+              if (scenario.kind==='device_throw') {
+                throw new Error('QA_INJECTED_RESPONSE_LOST_AFTER_DEVICE_INSERT');
+              }
               return {select:() => ({single:async () =>
-                ({data:{id:deviceId},error:null})})};
+                scenario.kind==='device_error'
+                  ? {data:null,error:{message:'QA_INJECTED_DEVICE_INSERT'}}
+                  : {data:{id:deviceId},error:null}})};
             }
             if (table === 'shared_operational_device_apps') {
               assert.equal(values.length,1);
               calls.push('apps_create');
-              return Promise.resolve({error:null});
+              if (scenario.kind==='apps_throw') {
+                throw new Error('QA_INJECTED_APPS_NETWORK_ABORT');
+              }
+              return Promise.resolve({error:scenario.kind==='apps_error'
+                ? {message:'QA_INJECTED_APPS_FAILURE'}:null});
             }
             if (table === 'shared_operational_device_events') {
               assert.equal(values.event_type,'device.created');
@@ -2469,12 +2503,22 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
           return {error:scenario.cleanupFails
             ? {message:'QA_INJECTED_AUTH_CLEANUP_ERROR'} : null};
         },
+        async updateUserById(id,attributes) {
+          assert.equal(id,deviceUserId);
+          assert.equal(attributes.ban_duration,'876000h');
+          calls.push('auth_ban');
+          return {error:null};
+        },
       }},
       async rpc(name,args) {
         assert.equal(name,'apply_shared_device_template_actor_policies_v1');
         assert.equal(args.p_device_id,deviceId);
         calls.push('template_policies');
-        return {error:null};
+        if (scenario.kind==='policies_throw') {
+          throw new Error('QA_INJECTED_POLICY_NETWORK_ABORT');
+        }
+        return {error:scenario.kind==='policies_error'
+          ? {message:'QA_INJECTED_POLICY_FAILURE'}:null};
       },
     };
     const action = runInNewContext(code, {
@@ -2504,14 +2548,26 @@ test('GAP-PKG-004 device creation confirms audit or reports and compensates fail
     const result = await action({status:'idle'},form);
     const success = scenario.kind === 'success';
     assert.equal(result.status,success?'success':'error',scenario.name);
-    assert.deepEqual(calls,success
-      ? ['auth_create','device_create','apps_create','template_policies','audit_attempt']
-      : ['auth_create','device_create','apps_create','template_policies','audit_attempt',
-        'device_delete','auth_delete'],scenario.name);
+    const expectedCalls=['auth_create','device_create'];
+    if (!['device_error','device_throw'].includes(scenario.kind)) {
+      expectedCalls.push('apps_create');
+    }
+    if (!['device_error','device_throw','apps_error','apps_throw']
+      .includes(scenario.kind)) expectedCalls.push('template_policies');
+    if (['success','error','throw'].includes(scenario.kind)) {
+      expectedCalls.push('audit_attempt');
+    }
+    if (!success) {
+      if (scenario.kind.startsWith('device_')) expectedCalls.push('device_lookup');
+      if (scenario.kind!=='device_error') expectedCalls.push('device_delete');
+      expectedCalls.push('auth_delete');
+      if (scenario.cleanupFails) expectedCalls.push('auth_ban');
+    }
+    assert.deepEqual(calls,expectedCalls,scenario.name);
     if (!success) {
       assert.match(result.message,scenario.cleanupFails
         ? /requiere conciliación administrativa/u
-        : /se revirtió la creación/u,scenario.name);
+        : /[Ss]e revirtió la creación/u,scenario.name);
       assert.equal(result.device,undefined,scenario.name);
     } else {
       assert.equal(result.device.id,deviceId);
