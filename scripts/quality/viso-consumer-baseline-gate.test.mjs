@@ -1779,3 +1779,284 @@ test('GAP-PKG-004 VISO administrative review requires actor-site grant and deleg
   assert.equal(calls[1].args.p_checkout_at, null);
 });
 
+test('GAP-PKG-004 device creation enforces destination SITE/GLOBAL before provisioning Auth', async () => {
+  const source = fs.readFileSync(
+    new URL('../../src/app/staff/shared-devices/new/page.tsx', import.meta.url), 'utf8',
+  );
+  const start = source.indexOf('async function createSharedDeviceAction(');
+  const end = source.indexOf('\nexport default async function SharedDeviceCreatePage(', start);
+  assert.ok(start >= 0 && end > start, 'Test the real VISO server action, not a copied guard');
+  const actionCode = stripTypeScriptTypes(source.slice(start, end)) +
+    '\ncreateSharedDeviceAction';
+  const siteA = 'b0040000-0000-4000-8000-000000000001';
+  const siteB = 'b0040000-0000-4000-8000-000000000002';
+  const areaA = 'b0040000-0000-4000-8000-000000000003';
+  const areaB = 'b0040000-0000-4000-8000-000000000004';
+  const operator = 'b0040000-0000-4000-8000-000000000005';
+  const cases = [
+    {name:'own SITE',site:siteA,allowed:true,reachAuth:true},
+    {name:'global employee in other SITE',site:siteB,allowed:true,global:'employee',reachAuth:true},
+    {name:'global role in other SITE',site:siteB,allowed:true,global:'role',reachAuth:true},
+    {name:'SITE forgery with true effective RPC',site:siteB,allowed:true,reachAuth:false},
+    {name:'GLOBAL with destination denial',site:siteB,allowed:false,global:'employee',reachAuth:false},
+    {name:'own SITE revoked',site:siteA,allowed:false,reachAuth:false},
+    {name:'shared technical session',site:siteA,allowed:true,shared:true,reachAuth:false},
+    {name:'inactive origin membership',site:siteA,allowed:true,membership:false,reachAuth:false},
+    {name:'inactive destination',site:siteA,allowed:true,destination:false,reachAuth:false},
+    {name:'foreign area on own SITE',site:siteA,area:areaB,allowed:true,reachAuth:false},
+    {name:'authorized area on own SITE',site:siteA,area:areaA,allowed:true,reachAuth:true},
+    {name:'invalid area',site:siteA,area:'not-an-area',allowed:true,reachAuth:false},
+    {name:'invalid destination',site:'not-a-site',allowed:true,reachAuth:false},
+    {name:'GLOBAL without catalog',site:siteB,allowed:true,global:'employee',catalog:false,reachAuth:false},
+  ];
+  for (const scenario of cases) {
+    let authCreates = 0;
+    let insertAttempts = 0;
+    const lookups = [];
+    const admin = {
+      from(table) {
+        const filters = {};
+        const query = {
+          select() { return query; },
+          eq(column, value) { filters[column] = value; return query; },
+          is(column, value) { filters[column] = value; return query; },
+          or() { return query; },
+          limit() { return query; },
+          order() { return query; },
+          insert() { insertAttempts++; assert.fail('No database insertion is allowed in the action guard test'); },
+          async maybeSingle() {
+            lookups.push({table,filters:{...filters}});
+            let data = null;
+            if (table === 'employee_sites') {
+              assert.equal(filters.employee_id, operator);
+              assert.equal(filters.site_id, siteA);
+              data = scenario.membership === false ? null : {employee_id:operator};
+            } else if (table === 'sites') {
+              assert.equal(filters.id, scenario.site);
+              data = scenario.destination === false ? null : {id:scenario.site};
+            } else if (table === 'areas') {
+              data = filters.id === areaA && filters.site_id === siteA
+                ? {id:areaA} : null;
+            } else if (table === 'apps') {
+              data = scenario.catalog === false ? null : {id:'viso-app'};
+            } else if (table === 'app_permissions') {
+              assert.equal(filters.code, 'staff.manage');
+              data = {id:'staff-manage'};
+            } else if (table === 'employee_permissions') {
+              assert.equal(filters.scope_type, 'global');
+              data = scenario.global === 'employee' ? {id:'global-employee'} : null;
+            } else if (table === 'role_permissions') {
+              assert.equal(filters.or, undefined);
+              data = scenario.global === 'role' ? {permission_id:'staff-manage'} : null;
+            } else if (table === 'shared_operational_device_templates') {
+              data = {id:'synthetic-template',code:'QA_ONLY',device_type:'tablet',
+                default_app_code:'viso',is_active:true};
+            } else if (table === 'shared_operational_devices') {
+              data = null;
+            } else {
+              assert.fail('Unexpected privileged table lookup: ' + table);
+            }
+            return {data,error:null};
+          },
+          then(resolve, reject) {
+            if (table !== 'shared_operational_device_template_apps') {
+              return Promise.reject(new Error('Unexpected query list: ' + table))
+                .then(resolve, reject);
+            }
+            return Promise.resolve({data:[{app_code:'viso',is_default:true,
+              is_active:true,sort_order:0}],error:null}).then(resolve, reject);
+          },
+        };
+        return query;
+      },
+      auth: {admin: {
+        async createUser() {
+          authCreates++;
+          return {data:{user:null},error:{message:'QA_STOP_BEFORE_AUTH_MUTATION'}};
+        },
+      }},
+    };
+    const action = runInNewContext(actionCode, {
+      requireAppAccess: async ({appId,permissionCode}) => {
+        assert.equal(appId, 'viso');
+        assert.equal(permissionCode, 'staff.manage');
+        return {user:{id:operator},siteId:siteA,
+          operationalSession:{isSharedDevice:scenario.shared === true,role:'cajero'},
+          supabase:{async rpc(name,args) {
+            assert.equal(name,'has_permission');
+            assert.equal(args.p_permission_code,'viso.staff.manage');
+            assert.equal(args.p_site_id,scenario.site);
+            assert.equal(args.p_area_id,scenario.area ?? null);
+            return {data:scenario.allowed === true,error:null};
+          }}};
+      },
+      createAdminClient: () => admin,
+      textValue: (form,name) => String(form.get(name) ?? '').trim(),
+      normalizeDeviceCode: (value) => String(value).trim().toUpperCase(),
+      uniqueAppCodes: (items) => [...new Set(items)],
+      generatePassword: () => 'NONPERSISTENT_QA_PASSWORD',
+      FormData,
+    }, {timeout:5000});
+    const form = new FormData();
+    form.set('template_id','synthetic-template');
+    form.set('label','QA controlled nonpersistent device');
+    form.set('site_id',scenario.site);
+    if (scenario.area) form.set('area_id',scenario.area);
+    form.append('app_codes','viso');
+    form.set('default_app_code','viso');
+    const result = await action({status:'idle'},form);
+    assert.equal(result.status,'error',scenario.name);
+    assert.equal(authCreates,Number(scenario.reachAuth),scenario.name);
+    assert.equal(insertAttempts,0,scenario.name);
+    assert.match(result.message,scenario.reachAuth
+      ? /QA_STOP_BEFORE_AUTH_MUTATION/u : /No tienes autorización/u,scenario.name);
+    if (scenario.site === siteB && !scenario.allowed) {
+      assert.equal(lookups.some(item => item.table === 'shared_operational_device_templates'),
+        false,scenario.name);
+    }
+  }
+});
+
+test('GAP-PKG-004 device creation confirms audit or reports and compensates failure', async () => {
+  const source = fs.readFileSync(
+    new URL('../../src/app/staff/shared-devices/new/page.tsx', import.meta.url), 'utf8',
+  );
+  const start = source.indexOf('async function createSharedDeviceAction(');
+  const end = source.indexOf('\nexport default async function SharedDeviceCreatePage(', start);
+  assert.ok(start >= 0 && end > start);
+  const code = stripTypeScriptTypes(source.slice(start,end)) + '\ncreateSharedDeviceAction';
+  const site = 'b0040000-0000-4000-8000-000000000031';
+  const adminId = 'b0040000-0000-4000-8000-000000000032';
+  const deviceId = 'b0040000-0000-4000-8000-000000000033';
+  const deviceUserId = 'b0040000-0000-4000-8000-000000000034';
+  for (const scenario of [
+    {name:'audit success',kind:'success'},
+    {name:'audit SQL error',kind:'error'},
+    {name:'audit network throw',kind:'throw'},
+    {name:'audit and cleanup failure',kind:'error',cleanupFails:true},
+  ]) {
+    const calls = [];
+    const admin = {
+      from(table) {
+        const filters = {};
+        const query = {
+          select() { return query; },
+          eq(column,value) { filters[column] = value; return query; },
+          order() { return query; },
+          async maybeSingle() {
+            if (table === 'employee_sites') {
+              assert.equal(filters.employee_id,adminId);
+              assert.equal(filters.site_id,site);
+              return {data:{employee_id:adminId},error:null};
+            }
+            if (table === 'sites') return {data:{id:site},error:null};
+            if (table === 'shared_operational_device_templates') {
+              return {data:{id:'qa-template',code:'QA_ONLY',device_type:'tablet',
+                default_app_code:'viso',is_active:true},error:null};
+            }
+            if (table === 'shared_operational_devices') return {data:null,error:null};
+            assert.fail('Unexpected lookup in device audit test: ' + table);
+          },
+          then(resolve,reject) {
+            assert.equal(table,'shared_operational_device_template_apps');
+            return Promise.resolve({data:[{app_code:'viso',is_default:true,is_active:true}],error:null})
+              .then(resolve,reject);
+          },
+          insert(values) {
+            if (table === 'shared_operational_devices') {
+              assert.equal(values.activation_status,'active');
+              assert.equal(values.site_id,site);
+              calls.push('device_create');
+              return {select:() => ({single:async () =>
+                ({data:{id:deviceId},error:null})})};
+            }
+            if (table === 'shared_operational_device_apps') {
+              assert.equal(values.length,1);
+              calls.push('apps_create');
+              return Promise.resolve({error:null});
+            }
+            if (table === 'shared_operational_device_events') {
+              assert.equal(values.event_type,'device.created');
+              assert.equal(values.device_id,deviceId);
+              calls.push('audit_attempt');
+              if (scenario.kind === 'throw') throw new Error('QA_INJECTED_NETWORK_ABORT');
+              return Promise.resolve({error:scenario.kind === 'error'
+                ? {message:'QA_INJECTED_AUDIT_DENIAL'} : null});
+            }
+            assert.fail('Unexpected insert: ' + table);
+          },
+          delete() {
+            assert.equal(table,'shared_operational_devices');
+            calls.push('device_delete');
+            return {eq(field,value) {
+              assert.equal(field,'id');
+              assert.equal(value,deviceId);
+              return {select:async () => ({data:scenario.cleanupFails
+                ? [] : [{id:deviceId}],error:scenario.cleanupFails
+                  ? {message:'QA_INJECTED_DELETE_ERROR'} : null})};
+            }};
+          },
+        };
+        return query;
+      },
+      auth:{admin:{
+        async createUser() {
+          calls.push('auth_create');
+          return {data:{user:{id:deviceUserId}},error:null};
+        },
+        async deleteUser(id) {
+          assert.equal(id,deviceUserId);
+          calls.push('auth_delete');
+          return {error:scenario.cleanupFails
+            ? {message:'QA_INJECTED_AUTH_CLEANUP_ERROR'} : null};
+        },
+      }},
+      async rpc(name,args) {
+        assert.equal(name,'apply_shared_device_template_actor_policies_v1');
+        assert.equal(args.p_device_id,deviceId);
+        calls.push('template_policies');
+        return {error:null};
+      },
+    };
+    const action = runInNewContext(code, {
+      requireAppAccess: async () => ({
+        user:{id:adminId},siteId:site,
+        operationalSession:{isSharedDevice:false,role:'cajero'},
+        supabase:{async rpc(name,args) {
+          assert.equal(name,'has_permission');
+          assert.equal(args.p_site_id,site);
+          return {data:true,error:null};
+        }},
+      }),
+      createAdminClient:()=>admin,
+      textValue:(form,key)=>String(form.get(key)??'').trim(),
+      normalizeDeviceCode:(value)=>String(value).trim().toUpperCase(),
+      uniqueAppCodes:(xs)=>[...new Set(xs)],
+      generatePassword:()=> 'QA_NONPERSISTENT_PASSWORD',
+      boolValue:(form,key)=>form.get(key)==='on',
+      FormData,
+    },{timeout:5000});
+    const form = new FormData();
+    form.set('template_id','qa-template');
+    form.set('site_id',site);
+    form.set('label','QA controlled device');
+    form.set('default_app_code','viso');
+    form.append('app_codes','viso');
+    const result = await action({status:'idle'},form);
+    const success = scenario.kind === 'success';
+    assert.equal(result.status,success?'success':'error',scenario.name);
+    assert.deepEqual(calls,success
+      ? ['auth_create','device_create','apps_create','template_policies','audit_attempt']
+      : ['auth_create','device_create','apps_create','template_policies','audit_attempt',
+        'device_delete','auth_delete'],scenario.name);
+    if (!success) {
+      assert.match(result.message,scenario.cleanupFails
+        ? /requiere conciliación administrativa/u
+        : /se revirtió la creación/u,scenario.name);
+      assert.equal(result.device,undefined,scenario.name);
+    } else {
+      assert.equal(result.device.id,deviceId);
+    }
+  }
+});
+

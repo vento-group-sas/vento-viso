@@ -82,17 +82,18 @@ function uniqueAppCodes(values: string[]) {
   return Array.from(new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean)));
 }
 
-export async function createSharedDeviceAction(
+async function createSharedDeviceAction(
   _prevState: SharedDeviceCreateState,
   formData: FormData,
 ): Promise<SharedDeviceCreateState> {
   "use server";
 
-  const { user } = await requireAppAccess({
+  const access = await requireAppAccess({
     appId: "viso",
     returnTo: "/staff/shared-devices/new",
     permissionCode: "staff.manage",
   });
+  const { user } = access;
 
   const admin = createAdminClient();
 
@@ -131,6 +132,86 @@ export async function createSharedDeviceAction(
       status: "error",
       message: "Selecciona la sede del dispositivo.",
     };
+  }
+
+  // The submitted site/area are untrusted. The initial app guard checks the
+  // operator's active session, NOT authority over a different destination.
+  // Fail closed before provisioning an Auth user with service_role.
+  const denyTerritory = (): SharedDeviceCreateState => ({
+    status: "error",
+    message: "No tienes autorización para crear un dispositivo en la sede o área solicitada.",
+  });
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value);
+  const operatorSiteId = String(access.siteId ?? "").trim();
+  if (access.operationalSession.isSharedDevice ||
+      !isUuid(operatorSiteId) || !isUuid(siteId) ||
+      (areaId !== null && !isUuid(areaId))) {
+    return denyTerritory();
+  }
+
+  const [
+    { data: operatorSite, error: operatorSiteError },
+    { data: destination, error: destinationError },
+  ] = await Promise.all([
+    admin.from("employee_sites").select("employee_id")
+      .eq("employee_id", user.id).eq("site_id", operatorSiteId)
+      .eq("is_active", true).maybeSingle(),
+    admin.from("sites").select("id")
+      .eq("id", siteId).eq("is_active", true).maybeSingle(),
+  ]);
+  if (operatorSiteError || !operatorSite || destinationError || !destination) {
+    return denyTerritory();
+  }
+
+  const { data: targetAllowed, error: targetPermissionError } =
+    await access.supabase.rpc("has_permission", {
+      p_permission_code: "viso.staff.manage",
+      p_site_id: siteId,
+      p_area_id: areaId,
+    });
+  if (targetPermissionError || targetAllowed !== true) return denyTerritory();
+
+  if (siteId !== operatorSiteId) {
+    // An effective permission evaluated with a target site is necessary but
+    // cross-site administration also requires explicit GLOBAL provenance.
+    // A SITE grant (or a NULL-site RPC result) must never imply GLOBAL scope.
+    const { data: app, error: appError } = await admin
+      .from("apps").select("id").eq("code", "viso").maybeSingle();
+    if (appError || !app) return denyTerritory();
+    const { data: permission, error: permissionError } = await admin
+      .from("app_permissions").select("id").eq("app_id", app.id)
+      .eq("code", "staff.manage").eq("is_active", true).maybeSingle();
+    if (permissionError || !permission) return denyTerritory();
+
+    const [{ data: employeeGlobal, error: employeeError },
+      { data: roleGlobal, error: roleError }] = await Promise.all([
+      admin.from("employee_permissions").select("id")
+        .eq("employee_id", user.id).eq("permission_id", permission.id)
+        .eq("is_allowed", true).eq("scope_type", "global")
+        .is("scope_site_id", null).is("scope_area_id", null)
+        .is("scope_site_type", null).is("scope_area_kind", null)
+        .limit(1).maybeSingle(),
+      access.operationalSession.role
+        ? admin.from("role_permissions").select("permission_id")
+          .eq("role", access.operationalSession.role)
+          .eq("permission_id", permission.id).eq("is_allowed", true)
+          .or("scope_type.eq.global,scope_type.is.null")
+          .is("scope_site_id", null).is("scope_area_id", null)
+          .is("scope_site_type", null).is("scope_area_kind", null)
+          .limit(1).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
+    if (employeeError || roleError || (!employeeGlobal && !roleGlobal)) {
+      return denyTerritory();
+    }
+  }
+
+  if (areaId !== null) {
+    const { data: targetArea, error: areaError } = await admin
+      .from("areas").select("id").eq("id", areaId)
+      .eq("site_id", siteId).eq("is_active", true).maybeSingle();
+    if (areaError || !targetArea) return denyTerritory();
   }
 
   const { data: template, error: templateError } = await admin
@@ -338,25 +419,61 @@ export async function createSharedDeviceAction(
     };
   }
 
-  await admin.from("shared_operational_device_events").insert({
-    device_id: device.id,
-    session_user_id: authUserId,
-    actor_employee_id: user.id,
-    app_code: "viso",
-    site_id: siteId,
-    area_id: areaId,
-    event_type: "device.created",
-    source: "admin",
-    event_payload: {
-      code,
-      label,
-      login_email: loginEmail,
-      template_id: template.id,
-      template_code: template.code,
-      app_codes: appCodes,
-      default_app_code: defaultAppCode,
-    },
-  });
+  // A device cannot be reported as provisioned without its audit event.
+  // A DB/network failure after Auth provisioning must fail closed, even
+  // though Auth and Postgres are separate transactions.
+  let auditConfirmed = false;
+  try {
+    const { error: auditError } = await admin
+      .from("shared_operational_device_events").insert({
+        device_id: device.id,
+        session_user_id: authUserId,
+        actor_employee_id: user.id,
+        app_code: "viso",
+        site_id: siteId,
+        area_id: areaId,
+        event_type: "device.created",
+        source: "admin",
+        event_payload: {
+          code,
+          label,
+          login_email: loginEmail,
+          template_id: template.id,
+          template_code: template.code,
+          app_codes: appCodes,
+          default_app_code: defaultAppCode,
+        },
+      });
+    auditConfirmed = !auditError;
+  } catch {
+    auditConfirmed = false;
+  }
+  if (!auditConfirmed) {
+    let deviceRemoved = false;
+    let accountRemoved = false;
+    try {
+      const { data: deleted, error: deleteError } = await admin
+        .from("shared_operational_devices").delete().eq("id", device.id)
+        .select("id");
+      deviceRemoved = !deleteError && Boolean(
+        deleted?.some((item) => item.id === device.id),
+      );
+    } catch {
+      deviceRemoved = false;
+    }
+    try {
+      const { error: deleteUserError } = await admin.auth.admin.deleteUser(authUserId);
+      accountRemoved = !deleteUserError;
+    } catch {
+      accountRemoved = false;
+    }
+    return {
+      status: "error",
+      message: deviceRemoved && accountRemoved
+        ? "No se confirmó la auditoría y se revirtió la creación. Revisa el registro antes de reintentar."
+        : "No se confirmó la auditoría. La reversa requiere conciliación administrativa antes de reintentar.",
+    };
+  }
 
   return {
     status: "success",
