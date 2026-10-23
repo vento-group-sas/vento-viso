@@ -1306,6 +1306,34 @@ async function verifyStaffNominalHttp({
     assert.equal(run.status, 0, 'ISOLATED QA PostgreSQL: ' + (run.stderr ?? '').slice(-1300));
     return run.stdout.trim();
   };
+  // Recover only a previous interrupted GAP004 device profile that has no
+  // Auth owner, employee or device. Refuse ambiguous or old records.
+  const orphanPredicate = [
+    "u.email ~ '^gap004-device-[a-f0-9]{32}@example[.]invalid$'",
+    "u.created_at > now() - interval '2 hours'",
+    'NOT EXISTS (SELECT 1 FROM auth.users a WHERE a.id=u.id)',
+    'NOT EXISTS (SELECT 1 FROM public.shared_operational_devices d WHERE d.auth_user_id=u.id)',
+    'NOT EXISTS (SELECT 1 FROM public.employees e WHERE e.id=u.id)',
+  ].join(' AND ');
+  const pendingOrphans = db('SELECT count(*) FROM public.users u WHERE ' +
+    orphanPredicate + ';');
+  if (pendingOrphans !== '0') {
+    assert.equal(pendingOrphans,'1',
+      'Only one unambiguous recent QA-owned orphan can be recovered');
+    const recovered = db([
+      'BEGIN;',
+      "SET LOCAL statement_timeout='10s';",
+      'DO $gap004_qa_orphan$ BEGIN',
+      'IF (SELECT count(*) FROM public.users u WHERE ' + orphanPredicate +
+        ")<>1 THEN RAISE EXCEPTION 'GAP004_ORPHAN_OWNERSHIP_DRIFT'; END IF;",
+      'END $gap004_qa_orphan$;',
+      'DELETE FROM public.users u WHERE ' + orphanPredicate + ';',
+      "SELECT count(*) FROM public.users u WHERE u.email ~ '^gap004-device-[a-f0-9]{32}@example[.]invalid$';",
+      'COMMIT;',
+    ].join('\n'));
+    assert.equal(recovered,'0','QA-owned orphan cleanup must be complete');
+    console.log('GAP004_QA_PRIOR_OWNED_PROFILE_RECOVERED');
+  }
   const snapshot = () => {
     const userList = users.map(uuid).join(',');
     return JSON.parse(db([
@@ -1463,6 +1491,201 @@ async function verifyStaffNominalHttp({
     assert.equal(foreignAllowed.status, 200, 'Explicit GLOBAL grant should allow assigned remote worker');
     assert.match(foreignAllowed.html, /GAP004_HTTP_SITE_B_TARGET/u);
     console.log('GAP004_VISO_REAL_HTTP_NOMINAL_SITE_GLOBAL_PASS');
+
+    // GAP-PKG-004: exercise the actual VISO device-creation action against
+    // the already verified isolated GoTrue/Postgres stack. This is a server
+    // action integration test, NOT an unrestricted browser POST. The existing
+    // authenticated operator and SITE A belong exclusively to this fixture.
+    const templateId = randomUUID();
+    const deviceGrantId = randomUUID();
+    const deviceCode = 'GAP004_DV_' + nonce.slice(0, 19).toUpperCase();
+    const templateCode = 'GAP004_TPL_' + nonce.slice(0, 19).toUpperCase();
+    const deviceEmail = 'gap004-device-' + nonce + '@example.invalid';
+    const deviceUuid = (id) => {
+      assert.match(id, /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu);
+      return "'" + id + "'::uuid";
+    };
+    const deviceSnapshot = () => JSON.parse(db([
+      'SELECT json_build_object(',
+      " 'technical_auth',(SELECT count(*) FROM auth.users WHERE email='" + deviceEmail + "'),",
+      " 'technical_profile',(SELECT count(*) FROM public.users WHERE email='" + deviceEmail + "'),",
+      " 'templates',(SELECT count(*) FROM public.shared_operational_device_templates WHERE id=" + deviceUuid(templateId) + "),",
+      " 'template_apps',(SELECT count(*) FROM public.shared_operational_device_template_apps WHERE template_id=" + deviceUuid(templateId) + "),",
+      " 'manager_grants',(SELECT count(*) FROM public.employee_permissions WHERE id=" + deviceUuid(deviceGrantId) + "),",
+      " 'devices',(SELECT count(*) FROM public.shared_operational_devices WHERE code='" + deviceCode + "'),",
+      " 'device_apps',(SELECT count(*) FROM public.shared_operational_device_apps WHERE device_id IN (SELECT id FROM public.shared_operational_devices WHERE code='" + deviceCode + "')),",
+      " 'device_events',(SELECT count(*) FROM public.shared_operational_device_events WHERE event_payload->>'code'='" + deviceCode + "')",
+      ');',
+    ].join('\n')));
+    const initialDeviceState = deviceSnapshot();
+    assert.ok(Object.values(initialDeviceState).every(count => count === 0),
+      'Real-device QA fixture must be absent before starting');
+    let setupStarted = false;
+    let deviceProvisioned = false;
+    try {
+      setupStarted = true;
+      db([
+        'BEGIN;',
+        "SET LOCAL statement_timeout='15s';",
+        'INSERT INTO public.employee_permissions(id,employee_id,permission_id,is_allowed,scope_type,scope_site_id)',
+        'SELECT ' + deviceUuid(deviceGrantId) + ',' + uuid('actor') +
+          ",p.id,true,'site'," + uuid('siteA'),
+        'FROM public.app_permissions p JOIN public.apps a ON a.id=p.app_id',
+        "WHERE a.code='viso' AND p.code='staff.manage' AND p.is_active=true;",
+        'INSERT INTO public.shared_operational_device_templates',
+        '(id,code,label,device_type,default_app_code,is_active)',
+        'VALUES (' + deviceUuid(templateId) + ",'" + templateCode +
+          "','GAP004 QA Device Template','tablet','viso',true);",
+        'INSERT INTO public.shared_operational_device_template_apps(template_id,app_code,is_default,is_active)',
+        'VALUES (' + deviceUuid(templateId) + ",'viso',true,true);",
+        'COMMIT;',
+      ].join('\n'));
+      assert.equal(deviceSnapshot().manager_grants, 1,
+        'Real SITE grant must be created for the synthetic operator');
+      const permission = await cookieClient.rpc('has_permission', {
+        p_permission_code:'viso.staff.manage',p_site_id:ids.siteA,p_area_id:null,
+      });
+      assert.equal(permission.error, null);
+      assert.equal(permission.data, true,
+        'Real JWT must authorize creating a device in SITE A');
+
+      const source = fs.readFileSync(
+        new URL('../../src/app/staff/shared-devices/new/page.tsx', import.meta.url),
+        'utf8',
+      );
+      const start = source.indexOf('async function createSharedDeviceAction(');
+      const end = source.indexOf('\nexport default async function SharedDeviceCreatePage(',start);
+      assert.ok(start >= 0 && end > start, 'Use the real VISO action source');
+      const sourceAction = stripTypeScriptTypes(source.slice(start,end)) +
+        '\ncreateSharedDeviceAction';
+      const action = runInNewContext(sourceAction, {
+        requireAppAccess: async ({appId,permissionCode}) => {
+          assert.equal(appId,'viso');
+          assert.equal(permissionCode,'staff.manage');
+          const {data:userData,error:userError} = await cookieClient.auth.getUser();
+          assert.equal(userError,null);
+          assert.equal(userData.user?.id,ids.actor);
+          return {user:userData.user,siteId:ids.siteA,
+            operationalSession:{isSharedDevice:false,role:'cajero'},
+            supabase:cookieClient};
+        },
+        createAdminClient:() => service,
+        textValue:(form,key)=>String(form.get(key)??'').trim(),
+        normalizeDeviceCode:(value)=>String(value).normalize('NFD')
+          .replace(/[\u0300-\u036f]/g,'').trim().toUpperCase()
+          .replace(/[^A-Z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,64),
+        uniqueAppCodes:(values)=>[...new Set(values.map(v=>v.trim().toLowerCase())
+          .filter(Boolean))],
+        boolValue:(form,key)=>form.get(key)==='on',
+        generatePassword:()=> 'Vento-' + randomUUID() + '-QA',
+        FormData,
+      },{timeout:5000});
+      const makeForm = (site, app) => {
+        const form = new FormData();
+        form.set('template_id',templateId);
+        form.set('label','GAP004 QA Real Auth DB Device');
+        form.set('code',deviceCode);
+        form.set('site_id',site);
+        form.set('login_email',deviceEmail);
+        form.append('app_codes',app);
+        form.set('default_app_code','viso');
+        return form;
+      };
+      const forbidden = await action({status:'idle'},makeForm(ids.siteB,'viso'));
+      assert.equal(forbidden.status,'error','Foreign SITE must be denied');
+      assert.match(forbidden.message,/No tienes autorización/u);
+      assert.deepEqual(deviceSnapshot(),{
+        ...initialDeviceState,manager_grants:1,templates:1,template_apps:1,
+      },'Foreign SITE attempt must not provision real Auth or device rows');
+      const unknownApp = await action({status:'idle'},makeForm(ids.siteA,'unknown-qa-app'));
+      assert.equal(unknownApp.status,'error','Unregistered app must be denied');
+      assert.deepEqual(deviceSnapshot(),{
+        ...initialDeviceState,manager_grants:1,templates:1,template_apps:1,
+      },'Unknown app must not provision real Auth or device rows');
+
+      const createdDevice = await action({status:'idle'},makeForm(ids.siteA,'viso'));
+      assert.equal(createdDevice.status,'success',
+        'Real Supabase Auth/DB provisioning must succeed: ' +
+        (createdDevice.status === 'error' ? createdDevice.message : 'unknown'));
+      assert.equal(createdDevice.device.code,deviceCode);
+      const stored = await service.from('shared_operational_devices')
+        .select('id,code,auth_user_id,site_id,activation_status,template_id')
+        .eq('id',createdDevice.device.id).single();
+      assert.equal(stored.error,null);
+      assert.equal(stored.data?.site_id,ids.siteA);
+      assert.equal(stored.data?.activation_status,'active');
+      assert.equal(stored.data?.template_id,templateId);
+      const [storedApps,storedEvents] = await Promise.all([
+        service.from('shared_operational_device_apps').select('app_code,is_default')
+          .eq('device_id',createdDevice.device.id),
+        service.from('shared_operational_device_events')
+          .select('event_type,actor_employee_id,session_user_id,source')
+          .eq('device_id',createdDevice.device.id),
+      ]);
+      assert.equal(storedApps.error,null);
+      assert.deepEqual(storedApps.data?.map(item=>item.app_code),['viso']);
+      assert.equal(storedEvents.error,null);
+      assert.equal(storedEvents.data?.length,1);
+      assert.equal(storedEvents.data?.[0]?.event_type,'device.created');
+      assert.equal(storedEvents.data?.[0]?.source,'admin');
+      assert.equal(storedEvents.data?.[0]?.actor_employee_id,ids.actor);
+      assert.equal(storedEvents.data?.[0]?.session_user_id,stored.data.auth_user_id);
+      const deviceLoginClient = createClient(origin,anonKey,{
+        auth:{persistSession:false,autoRefreshToken:false},
+      });
+      const {data:deviceLogin,error:deviceLoginError} =
+        await deviceLoginClient.auth.signInWithPassword({
+          email:deviceEmail,password:createdDevice.device.temporaryPassword,
+        });
+      assert.equal(deviceLoginError,null,'Real technical device login must work');
+      assert.equal(deviceLogin.user?.id,stored.data.auth_user_id);
+      assert.equal(deviceLogin.user?.app_metadata?.account_type,
+        'shared_operational_device');
+      await deviceLoginClient.auth.signOut();
+      deviceProvisioned=true;
+    } finally {
+      // Each row is owned by a nonce or UUID from this isolated QA invocation.
+      // Remove event rows before device/employee rows (events have SET NULL FKs).
+      const cleanupFailures=[];
+      if (setupStarted) {
+        try {
+          db([
+            'BEGIN;',
+            "SET LOCAL statement_timeout='15s';",
+            'DELETE FROM public.shared_operational_device_events WHERE',
+            " event_payload->>'code'='" + deviceCode + "' AND source='admin';",
+            'DELETE FROM public.shared_operational_device_actor_policies',
+            'WHERE device_id IN (SELECT id FROM public.shared_operational_devices',
+            " WHERE code='" + deviceCode + "');",
+            'DELETE FROM public.shared_operational_device_apps',
+            'WHERE device_id IN (SELECT id FROM public.shared_operational_devices',
+            " WHERE code='" + deviceCode + "');",
+            "DELETE FROM public.shared_operational_devices WHERE code='" + deviceCode + "';",
+            'DELETE FROM public.shared_operational_device_template_apps WHERE template_id=' + deviceUuid(templateId) + ';',
+            'DELETE FROM public.shared_operational_device_templates WHERE id=' + deviceUuid(templateId) + ';',
+            'DELETE FROM public.employee_permissions WHERE id=' + deviceUuid(deviceGrantId) + ';',
+            "DELETE FROM public.users WHERE email='" + deviceEmail + "' AND id IN (SELECT id FROM auth.users WHERE email='" + deviceEmail + "');",
+            'COMMIT;',
+          ].join('\n'));
+        } catch { cleanupFailures.push('DEVICE_DB_CLEANUP'); }
+      }
+      try {
+        const technicalIds = db("SELECT id FROM auth.users WHERE email='" + deviceEmail + "';");
+        for (const technicalId of technicalIds.split('\n').filter(Boolean)) {
+          assert.match(technicalId,/^[0-9a-f-]{36}$/iu);
+          const {error} = await service.auth.admin.deleteUser(technicalId);
+          if (error) cleanupFailures.push('DEVICE_AUTH_CLEANUP');
+        }
+      } catch { cleanupFailures.push('DEVICE_AUTH_CLEANUP'); }
+      try {
+        db("DELETE FROM public.users WHERE email='" + deviceEmail + "' AND NOT EXISTS (SELECT 1 FROM auth.users WHERE id=public.users.id);");
+        assert.deepEqual(deviceSnapshot(),initialDeviceState);
+      } catch { cleanupFailures.push('DEVICE_RESIDUALS'); }
+      assert.deepEqual(cleanupFailures,[],
+        'Isolated real Auth/DB device integration must leave zero residue');
+    }
+    assert.equal(deviceProvisioned,true);
+    console.log('GAP004_REAL_AUTH_POSTGRES_DEVICE_ACTION_PASS');
   } finally {
     // Attempt every cleanup stage even if a previous stage fails. Never
     // orphan a synthetic Auth account because an SQL cleanup failed.
