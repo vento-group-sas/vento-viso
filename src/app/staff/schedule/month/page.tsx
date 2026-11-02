@@ -413,7 +413,7 @@ export default async function StaffScheduleMonthPage({
             Verifica la jornada pactada y los límites diarios y semanales antes de autorizar la publicación.
           </p>
         </div>
-      ) : null>
+      ) : null}
 
       <div className="ui-panel space-y-4">
         <div className="grid gap-4 xl:grid-cols-[minmax(260px,1fr)_minmax(280px,380px)]">
