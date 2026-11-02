@@ -589,3 +589,154 @@ export async function publishMonthAction(formData: FormData) {
   revalidatePath("/staff/schedule/month");
   redirectWithMessage(returnTo, "ok", "Mes publicado y notificado.");
 }
+
+/** Las autorizaciones semanales y los términos son globales al empleado.
+ * No basta administrar una sola sede cuando el trabajador presta servicio
+ * en otras sedes. Todos los ámbitos activos se autorizan por separado.
+ */
+async function requireLaborRecordAuthority(
+  employeeId: string,
+  siteId: string,
+  returnTo: string,
+) {
+  const { user } = await requireStaffScheduleAccess(returnTo, siteId);
+  await requireAppAccess({
+    appId: "viso",
+    returnTo,
+    permissionCode: "staff.manage",
+    siteId,
+    allowPermissionAccess: true,
+  });
+  const employee = await validateEmployeeSiteLink(employeeId, siteId, returnTo);
+  const supabase = createAdminClient();
+  const { data: links, error } = await supabase
+    .from("employee_sites")
+    .select("site_id")
+    .eq("employee_id", employeeId)
+    .eq("is_active", true);
+  if (error) redirectWithMessage(returnTo, "error", "No se pudieron comprobar las sedes del trabajador.");
+  const siteIds = new Set(
+    [employee.site_id, ...(links ?? []).map((link) => link.site_id)]
+      .filter((value): value is string => typeof value === "string" && value.length > 0),
+  );
+  for (const assignedSiteId of siteIds) {
+    await requireAppAccess({
+      appId: "viso",
+      returnTo,
+      permissionCode: "staff.manage",
+      siteId: assignedSiteId,
+      allowPermissionAccess: true,
+    });
+  }
+  return { user, supabase };
+}
+
+function parseIsoMonday(value: string): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T12:00:00Z`);
+  return Number.isFinite(parsed.valueOf()) &&
+    parsed.toISOString().slice(0, 10) === value &&
+    parsed.getUTCDay() === 1
+    ? value
+    : null;
+}
+
+function minutesFromHours(value: string): number | null {
+  const hours = Number(value.replace(",", "."));
+  const minutes = Math.round(hours * 60);
+  if (!Number.isFinite(hours) || Math.abs(minutes / 60 - hours) > 0.000001) {
+    return null;
+  }
+  return minutes;
+}
+
+export async function registerLaborTermsAction(formData: FormData) {
+  const employeeId = asText(formData.get("employee_id"));
+  const siteId = asText(formData.get("site_id"));
+  const month = asText(formData.get("month"));
+  const returnTo = buildMonthReturnTo(siteId, month);
+  const effectiveWeek = parseIsoMonday(asText(formData.get("effective_week")));
+  const weeklyMinutes = minutesFromHours(asText(formData.get("weekly_hours")));
+  const dailyMinutes = minutesFromHours(asText(formData.get("daily_hours")));
+  const flexible = asText(formData.get("flexible_agreed")) === "yes";
+  const agreementRef = asText(formData.get("agreement_reference"));
+  if (!siteId || !employeeId || !parseMonth(month) || !effectiveWeek) {
+    redirectWithMessage(returnTo, "error", "Trabajador, sede, mes o lunes de vigencia inválidos.");
+  }
+  if (weeklyMinutes === null || weeklyMinutes < 60 || weeklyMinutes > 42 * 60 ||
+      dailyMinutes === null || dailyMinutes < 60 || dailyMinutes > (flexible ? 9 : 8) * 60) {
+    redirectWithMessage(returnTo, "error", "La jornada pactada debe indicar hasta 42 h por semana y 8 h diarias, o hasta 9 h con acuerdo flexible.");
+  }
+  if (agreementRef.length < 6 || agreementRef.length > 240) {
+    redirectWithMessage(returnTo, "error", "Indica una referencia documental verificable del acuerdo (6 a 240 caracteres).");
+  }
+
+  const { user, supabase } = await requireLaborRecordAuthority(employeeId, siteId, returnTo);
+  const { error } = await supabase.from("viso_labor_terms").insert({
+    employee_id: employeeId,
+    effective_week: effectiveWeek,
+    ordinary_weekly_minutes: weeklyMinutes,
+    ordinary_daily_minutes: dailyMinutes,
+    flexible_daily_agreement: flexible,
+    agreement_reference: agreementRef,
+    recorded_by: user.id,
+  });
+  if (error) {
+    redirectWithMessage(
+      returnTo,
+      "error",
+      error.code === "23505"
+        ? "Ya existe una jornada registrada para ese trabajador y lunes. No se sobrescribirá la evidencia; selecciona una nueva vigencia."
+        : "No se pudo registrar la jornada pactada. Verifica el contrato y vuelve a intentarlo.",
+    );
+  }
+  revalidatePath("/staff/schedule/month");
+  redirectWithMessage(returnTo, "ok", "Jornada pactada registrada con vigencia y trazabilidad; los registros anteriores se conservan.");
+}
+
+export async function recordWeeklyOvertimeDecisionAction(formData: FormData) {
+  const employeeId = asText(formData.get("employee_id"));
+  const siteId = asText(formData.get("site_id"));
+  const month = asText(formData.get("month"));
+  const returnTo = buildMonthReturnTo(siteId, month);
+  const weekStart = parseIsoMonday(asText(formData.get("week_start")));
+  const decision = asText(formData.get("decision"));
+  const minutes = decision === "revoke"
+    ? 0
+    : minutesFromHours(asText(formData.get("authorized_hours")));
+  const reason = asText(formData.get("reason"));
+  const approvalRef = asText(formData.get("approval_reference"));
+  if (!siteId || !employeeId || !parseMonth(month) || !weekStart ||
+      !["approve", "revoke"].includes(decision)) {
+    redirectWithMessage(returnTo, "error", "Datos de autorización semanales incompletos o inválidos.");
+  }
+  if (minutes === null || (decision === "approve" && (minutes < 1 || minutes > 12 * 60))) {
+    redirectWithMessage(returnTo, "error", "Las horas extra autorizadas deben estar entre 1 minuto y 12 horas semanales.");
+  }
+  if (reason.length < 12 || reason.length > 500 ||
+      approvalRef.length < 6 || approvalRef.length > 240) {
+    redirectWithMessage(returnTo, "error", "Registra un motivo (12–500 caracteres) y soporte documental (6–240 caracteres).");
+  }
+
+  const { user, supabase } = await requireLaborRecordAuthority(employeeId, siteId, returnTo);
+  const { error } = await supabase.from("viso_weekly_overtime_decisions").insert({
+    employee_id: employeeId,
+    week_start: weekStart,
+    decision,
+    authorized_minutes: minutes,
+    reason,
+    approval_reference: approvalRef,
+    recorded_by: user.id,
+  });
+  if (error) {
+    redirectWithMessage(returnTo, "error", "No se pudo registrar la decisión. Comprueba que el trabajador tenga jornada vigente.");
+  }
+  revalidatePath("/staff/schedule/month");
+  redirectWithMessage(
+    returnTo,
+    "ok",
+    decision === "revoke"
+      ? "Autorización revocada con registro histórico; no se elimina el horario publicado."
+      : "Horas extra autorizadas para esa semana, registradas con responsable y soporte.",
+  );
+}
