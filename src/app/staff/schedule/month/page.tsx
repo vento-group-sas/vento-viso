@@ -36,6 +36,12 @@ import {
   MONTHLY_SCHEDULE_WARNING_MINUTES,
 } from "./constants";
 import { projectMonthlyPotentialOvertime } from "./overtime-projection";
+import { LaborTermsPanel } from "./labor-terms-panel";
+import {
+  evaluateLaborPublication,
+  type LaborTermsRow,
+  type OvertimeDecisionRow,
+} from "./labor-readiness";
 
 export const dynamic = "force-dynamic";
 
@@ -128,6 +134,10 @@ export default async function StaffScheduleMonthPage({
   // La semana de trabajo completa puede empezar/terminar fuera de este mes.
   const firstFullWeekDay = addDays(monthStart, -((monthStart.getDay() + 6) % 7));
   const lastFullWeekDay = addDays(monthEnd, (7 - monthEnd.getDay()) % 7);
+  const weekStarts: string[] = [];
+  for (let week = firstFullWeekDay; week <= lastFullWeekDay; week = addDays(week, 7)) {
+    weekStarts.push(isoDate(week));
+  }
   const monthDays = Array.from({ length: monthEnd.getDate() }, (_, index) => {
     const date = addDays(monthStart, index);
     return {
@@ -252,6 +262,34 @@ export default async function StaffScheduleMonthPage({
       : { data: [], error: null };
   const allSiteMonthShiftsData = allSiteMonthResult.data ?? [];
   const allSiteMonthShiftsError = allSiteMonthResult.error;
+  const [termsResult, decisionsResult] = employeeIds.length > 0
+    ? await Promise.all([
+        supabase.from("viso_labor_terms")
+          .select("employee_id,effective_week,ordinary_weekly_minutes,ordinary_daily_minutes,flexible_daily_agreement")
+          .in("employee_id", employeeIds)
+          .lte("effective_week", isoDate(lastFullWeekDay)),
+        supabase.from("viso_weekly_overtime_decisions")
+          .select("id,employee_id,week_start,decision,authorized_minutes,recorded_at")
+          .in("employee_id", employeeIds)
+          .gte("week_start", isoDate(firstFullWeekDay))
+          .lte("week_start", isoDate(lastFullWeekDay)),
+      ])
+    : [{ data: [], error: null }, { data: [], error: null }];
+  const laborTerms = (termsResult.data ?? []) as LaborTermsRow[];
+  const overtimeDecisions = (decisionsResult.data ?? []) as OvertimeDecisionRow[];
+  const laborDataError = termsResult.error?.message ?? decisionsResult.error?.message ?? null;
+  const laborReadiness = laborDataError || allSiteMonthShiftsError
+    ? []
+    : evaluateLaborPublication(
+        allSiteMonthShiftsData as ShiftRow[],
+        laborTerms,
+        overtimeDecisions,
+        selectedSiteId,
+        monthStartIso,
+        monthEndIso,
+        getShiftMinutes,
+      );
+  const laborBlocked = laborReadiness.some((week) => week.state !== "ready");
   const projectedOvertimeByEmployee = projectMonthlyPotentialOvertime(
     allSiteMonthShiftsData as ShiftRow[],
     monthStartIso,
@@ -415,6 +453,27 @@ export default async function StaffScheduleMonthPage({
         </div>
       ) : null}
 
+      <LaborTermsPanel
+        employees={employees.map((employee) => ({
+          id: employee.id,
+          label: employee.full_name ?? employee.alias ?? employee.id,
+        }))}
+        terms={laborTerms}
+        decisions={overtimeDecisions}
+        readiness={laborReadiness}
+        weeks={weekStarts}
+        siteId={selectedSiteId}
+        month={selectedMonthKey}
+        dataError={laborDataError}
+      />
+      {laborBlocked ? (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          Hay semanas sin contrato, sin autorización suficiente o con límites excedidos.
+          Registra o corrige las jornadas y decisiones antes de publicar. La comprobación
+          definitiva ocurre en PostgreSQL.
+        </div>
+      ) : null}
+
       <div className="ui-panel space-y-4">
         <div className="grid gap-4 xl:grid-cols-[minmax(260px,1fr)_minmax(280px,380px)]">
           <div>
@@ -499,7 +558,7 @@ export default async function StaffScheduleMonthPage({
                 <button
                   type="submit"
                   className="ui-btn ui-btn--brand"
-                  disabled={draftCount === 0 || Boolean(allSiteMonthShiftsError)}
+                  disabled={draftCount === 0 || Boolean(allSiteMonthShiftsError) || Boolean(laborDataError) || laborBlocked}
                 >
                   Publicar mes
                 </button>
@@ -752,7 +811,7 @@ export default async function StaffScheduleMonthPage({
                             {" · "}Posibles extras: {formatHours(projectedOvertimeByEmployee.get(employee.id)?.possibleExtraMinutes ?? 0)}
                           </div>
                           <p className="mt-1 text-[9px] opacity-75">
-                            Proyección sobre 42 h/semana de todas las sedes. La jornada pactada y los excesos diarios pueden cambiar el resultado; no es liquidación.
+                            Proyección general sobre 42 h/semana de todas las sedes. Usa la sección «Jornadas pactadas» para validar los límites de cada trabajador; esto no es una liquidación.
                           </p>
                           <div className="mt-1 text-[9px] opacity-75">
                             Todas las sedes · Pub. {formatHours(totals.published)} · Borr. {formatHours(totals.draft)}
