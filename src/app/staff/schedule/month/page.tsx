@@ -170,6 +170,11 @@ export default async function StaffScheduleMonthPage({
       : (operationalSites[0]?.id ?? "");
   const selectedSite =
     operationalSites.find((site) => site.id === selectedSiteId) ?? null;
+  // El selector puede escoger una sede por defecto, distinta a sp.site_id.
+  // Antes de leer términos laborales de esa sede debe autorizarse su contexto real.
+  if (selectedSiteId) {
+    await requireStaffScheduleAccess("/staff/schedule/month", selectedSiteId);
+  }
 
   const [directEmployeesRes, linkedEmployeesRes, shiftsRes, matrixRes, profilesRes] =
     await Promise.all([
