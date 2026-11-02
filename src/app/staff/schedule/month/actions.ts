@@ -598,6 +598,7 @@ async function requireLaborRecordAuthority(
   employeeId: string,
   siteId: string,
   returnTo: string,
+  weekStart?: string,
 ) {
   const { user } = await requireStaffScheduleAccess(returnTo, siteId);
   await requireAppAccess({
@@ -619,6 +620,22 @@ async function requireLaborRecordAuthority(
     [employee.site_id, ...(links ?? []).map((link) => link.site_id)]
       .filter((value): value is string => typeof value === "string" && value.length > 0),
   );
+  if (weekStart) {
+    const lastDay = new Date(`${weekStart}T12:00:00Z`);
+    lastDay.setUTCDate(lastDay.getUTCDate() + 6);
+    const { data: weeklyShifts, error: weeklyError } = await supabase
+      .from("employee_shifts")
+      .select("site_id")
+      .eq("employee_id", employeeId)
+      .gte("shift_date", weekStart)
+      .lte("shift_date", lastDay.toISOString().slice(0, 10));
+    if (weeklyError) {
+      redirectWithMessage(returnTo, "error", "No se pudieron comprobar todas las sedes de la semana.");
+    }
+    for (const row of weeklyShifts ?? []) {
+      if (row.site_id) siteIds.add(row.site_id);
+    }
+  }
   for (const assignedSiteId of siteIds) {
     await requireAppAccess({
       appId: "viso",
@@ -718,7 +735,7 @@ export async function recordWeeklyOvertimeDecisionAction(formData: FormData) {
     redirectWithMessage(returnTo, "error", "Registra un motivo (12–500 caracteres) y soporte documental (6–240 caracteres).");
   }
 
-  const { user, supabase } = await requireLaborRecordAuthority(employeeId, siteId, returnTo);
+  const { user, supabase } = await requireLaborRecordAuthority(employeeId, siteId, returnTo, weekStart);
   const { error } = await supabase.from("viso_weekly_overtime_decisions").insert({
     employee_id: employeeId,
     week_start: weekStart,
