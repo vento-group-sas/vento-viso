@@ -66,14 +66,16 @@ export function LaborTermsPanel({
           <input type="hidden" name="site_id" value={siteId} />
           <input type="hidden" name="month" value={month} />
           <label className="block text-xs font-medium">Trabajador
-            <select name="employee_id" required className="ui-input mt-1 w-full" defaultValue={employees[0]?.id ?? ""}>
+            <select name="employee_id" required className="ui-input mt-1 w-full" defaultValue="">
+              <option value="" disabled>Selecciona un trabajador</option>
               {employees.map((employee) => (
                 <option key={employee.id} value={employee.id}>{employee.label}</option>
               ))}
             </select>
           </label>
           <label className="block text-xs font-medium">Vigente desde la semana del lunes
-            <select name="effective_week" required className="ui-input mt-1 w-full" defaultValue={weeks[0] ?? ""}>
+            <select name="effective_week" required className="ui-input mt-1 w-full" defaultValue="">
+              <option value="" disabled>Selecciona el lunes de vigencia</option>
               {weeks.map((week) => <option key={week} value={week}>{week}</option>)}
             </select>
           </label>
@@ -108,14 +110,16 @@ export function LaborTermsPanel({
           <input type="hidden" name="site_id" value={siteId} />
           <input type="hidden" name="month" value={month} />
           <label className="block text-xs font-medium">Trabajador
-            <select name="employee_id" required className="ui-input mt-1 w-full" defaultValue={employees[0]?.id ?? ""}>
+            <select name="employee_id" required className="ui-input mt-1 w-full" defaultValue="">
+              <option value="" disabled>Selecciona un trabajador</option>
               {employees.map((employee) => (
                 <option key={employee.id} value={employee.id}>{employee.label}</option>
               ))}
             </select>
           </label>
           <label className="block text-xs font-medium">Semana que comienza el lunes
-            <select name="week_start" required className="ui-input mt-1 w-full" defaultValue={weeks[0] ?? ""}>
+            <select name="week_start" required className="ui-input mt-1 w-full" defaultValue="">
+              <option value="" disabled>Selecciona la semana a autorizar</option>
               {weeks.map((week) => <option key={week} value={week}>{week}</option>)}
             </select>
           </label>
