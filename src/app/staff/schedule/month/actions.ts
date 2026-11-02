@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
 import { notifyShiftChange } from "@/lib/anima/shift-notify";
+import { requireAppAccess } from "@/lib/auth/guard";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 import {
@@ -18,7 +19,7 @@ import {
   type ShiftRow,
   type SiteOperationalRoleRow,
 } from "../helpers";
-import { MONTHLY_SCHEDULE_LIMIT_MINUTES } from "./constants";
+import { MONTHLY_SCHEDULE_REFERENCE_MINUTES } from "./constants";
 
 const MAX_MONTHLY_SHIFT_BLOCKS = 12;
 
@@ -429,19 +430,19 @@ export async function createMonthlyShiftsAction(formData: FormData) {
   const employeeName =
     employee.full_name ?? employee.alias ?? "El trabajador seleccionado";
   const blockCount = resolvedBlocks.length;
-  if (projectedMinutes > MONTHLY_SCHEDULE_LIMIT_MINUTES) {
-    const excessMinutes = projectedMinutes - MONTHLY_SCHEDULE_LIMIT_MINUTES;
+  if (projectedMinutes > MONTHLY_SCHEDULE_REFERENCE_MINUTES) {
+    const excessMinutes = projectedMinutes - MONTHLY_SCHEDULE_REFERENCE_MINUTES;
     redirectWithMessage(
       returnTo,
       "warning",
-      `${payload.length} turnos de ${blockCount} ${blockCount === 1 ? "horario" : "horarios"} quedaron en borrador. ${employeeName} suma ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h y excede el límite mensual por ${(excessMinutes / 60).toFixed(1).replace(".", ",")} h. No podrá publicarse hasta corregirlo.`,
+      `${payload.length} turnos de ${blockCount} ${blockCount === 1 ? "horario" : "horarios"} quedaron en borrador. ${employeeName} suma ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h, ${(excessMinutes / 60).toFixed(1).replace(".", ",")} h sobre la referencia salarial mensual. Revisa la jornada pactada y la autorización de horas extra. La referencia no bloquea publicar.`,
     );
   }
 
   redirectWithMessage(
     returnTo,
     "ok",
-    `${payload.length} ${payload.length === 1 ? "turno guardado" : "turnos guardados"} en ${blockCount} ${blockCount === 1 ? "horario" : "horarios"}. Total proyectado: ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h de 186 h.`,
+    `${payload.length} ${payload.length === 1 ? "turno guardado" : "turnos guardados"} en ${blockCount} ${blockCount === 1 ? "horario" : "horarios"}. Total proyectado: ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h. Referencia salarial: 210 h (no es un límite legal de publicación).`,
   );
 }
 
@@ -514,6 +515,18 @@ export async function publishMonthAction(formData: FormData) {
     asText(formData.get("return_to")) || buildMonthReturnTo(siteId, month);
 
   const { user } = await requireStaffScheduleAccess(returnTo, siteId);
+  // Publicar turnos (incluidas posibles horas extra) requiere permiso real
+  // de administración. staff.schedule.view sólo permite visualizar horarios.
+  await requireAppAccess({
+    appId: "viso",
+    returnTo,
+    permissionCode: "staff.manage",
+    siteId,
+    allowPermissionAccess: true,
+  });
+  if (asText(formData.get("hours_reviewed")) !== "yes") {
+    redirectWithMessage(returnTo, "error", "Confirma la revisión de jornada pactada, descansos y horas extra antes de publicar.");
+  }
   const monthDate = parseMonth(month);
   if (!siteId || !monthDate) {
     redirectWithMessage(returnTo, "error", "Mes o sede inválidos.");
@@ -542,61 +555,6 @@ export async function publishMonthAction(formData: FormData) {
   const draftRows = shifts.filter((shift) => !shift.published_at);
   if (draftRows.length === 0) {
     redirectWithMessage(returnTo, "ok", "No hay borradores por publicar.");
-  }
-
-  const affectedEmployeeIds = [
-    ...new Set(shifts.map((shift) => shift.employee_id)),
-  ];
-  const { data: allSiteMonthRows, error: allSiteMonthError } = await supabase
-    .from("employee_shifts")
-    .select(
-      "id,employee_id,shift_date,start_time,end_time,shift_kind,operational_role,show_end_as_close,break_minutes,status,notes,site_id,area_id,checkin_site_id,checkout_site_id,published_at",
-    )
-    .in("employee_id", affectedEmployeeIds)
-    .gte("shift_date", monthStartIso)
-    .lte("shift_date", monthEndIso);
-
-  if (allSiteMonthError) {
-    redirectWithMessage(returnTo, "error", allSiteMonthError.message);
-  }
-
-  const totalsByEmployee = new Map<string, number>();
-  for (const shift of (allSiteMonthRows ?? []) as ShiftRow[]) {
-    if (shift.status === "cancelled") continue;
-    totalsByEmployee.set(
-      shift.employee_id,
-      (totalsByEmployee.get(shift.employee_id) ?? 0) + getShiftMinutes(shift),
-    );
-  }
-
-  const exceededIds = [...totalsByEmployee.entries()]
-    .filter(([, minutes]) => minutes > MONTHLY_SCHEDULE_LIMIT_MINUTES)
-    .map(([employeeId]) => employeeId);
-
-  if (exceededIds.length > 0) {
-    const { data: employees } = await supabase
-      .from("employees")
-      .select("id,full_name,alias")
-      .in("id", exceededIds);
-    const names = new Map(
-      (employees ?? []).map((employee: { id: string; full_name: string | null; alias: string | null }) => [
-        employee.id,
-        employee.full_name ?? employee.alias ?? employee.id,
-      ]),
-    );
-    const detail = exceededIds
-      .map((employeeId) => {
-        const minutes = totalsByEmployee.get(employeeId) ?? 0;
-        const excess = minutes - MONTHLY_SCHEDULE_LIMIT_MINUTES;
-        return `${names.get(employeeId) ?? employeeId}: ${(minutes / 60).toFixed(1).replace(".", ",")} h (+${(excess / 60).toFixed(1).replace(".", ",")} h)`;
-      })
-      .join("; ");
-
-    redirectWithMessage(
-      returnTo,
-      "error",
-      `No se puede publicar. Hay trabajadores por encima de 186 h: ${detail}.`,
-    );
   }
 
   const publishedAt = new Date().toISOString();
@@ -630,4 +588,172 @@ export async function publishMonthAction(formData: FormData) {
   revalidatePath("/staff/schedule");
   revalidatePath("/staff/schedule/month");
   redirectWithMessage(returnTo, "ok", "Mes publicado y notificado.");
+}
+
+/** Las autorizaciones semanales y los términos son globales al empleado.
+ * No basta administrar una sola sede cuando el trabajador presta servicio
+ * en otras sedes. Todos los ámbitos activos se autorizan por separado.
+ */
+async function requireLaborRecordAuthority(
+  employeeId: string,
+  siteId: string,
+  returnTo: string,
+  weekStart?: string,
+) {
+  const { user } = await requireStaffScheduleAccess(returnTo, siteId);
+  await requireAppAccess({
+    appId: "viso",
+    returnTo,
+    permissionCode: "staff.manage",
+    siteId,
+    allowPermissionAccess: true,
+  });
+  const employee = await validateEmployeeSiteLink(employeeId, siteId, returnTo);
+  const supabase = createAdminClient();
+  const { data: links, error } = await supabase
+    .from("employee_sites")
+    .select("site_id")
+    .eq("employee_id", employeeId)
+    .eq("is_active", true);
+  if (error) redirectWithMessage(returnTo, "error", "No se pudieron comprobar las sedes del trabajador.");
+  const siteIds = new Set(
+    [employee.site_id, ...(links ?? []).map((link) => link.site_id)]
+      .filter((value): value is string => typeof value === "string" && value.length > 0),
+  );
+  if (weekStart) {
+    const lastDay = new Date(`${weekStart}T12:00:00Z`);
+    lastDay.setUTCDate(lastDay.getUTCDate() + 6);
+    const { data: weeklyShifts, error: weeklyError } = await supabase
+      .from("employee_shifts")
+      .select("site_id")
+      .eq("employee_id", employeeId)
+      .gte("shift_date", weekStart)
+      .lte("shift_date", lastDay.toISOString().slice(0, 10));
+    if (weeklyError) {
+      redirectWithMessage(returnTo, "error", "No se pudieron comprobar todas las sedes de la semana.");
+    }
+    for (const row of weeklyShifts ?? []) {
+      if (row.site_id) siteIds.add(row.site_id);
+    }
+  }
+  for (const assignedSiteId of siteIds) {
+    await requireAppAccess({
+      appId: "viso",
+      returnTo,
+      permissionCode: "staff.manage",
+      siteId: assignedSiteId,
+      allowPermissionAccess: true,
+    });
+  }
+  return { user, supabase };
+}
+
+function parseIsoMonday(value: string): string | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const parsed = new Date(`${value}T12:00:00Z`);
+  return Number.isFinite(parsed.valueOf()) &&
+    parsed.toISOString().slice(0, 10) === value &&
+    parsed.getUTCDay() === 1
+    ? value
+    : null;
+}
+
+function minutesFromHours(value: string): number | null {
+  const hours = Number(value.replace(",", "."));
+  const minutes = Math.round(hours * 60);
+  if (!Number.isFinite(hours) || Math.abs(minutes / 60 - hours) > 0.000001) {
+    return null;
+  }
+  return minutes;
+}
+
+export async function registerLaborTermsAction(formData: FormData) {
+  const employeeId = asText(formData.get("employee_id"));
+  const siteId = asText(formData.get("site_id"));
+  const month = asText(formData.get("month"));
+  const returnTo = buildMonthReturnTo(siteId, month);
+  const effectiveWeek = parseIsoMonday(asText(formData.get("effective_week")));
+  const weeklyMinutes = minutesFromHours(asText(formData.get("weekly_hours")));
+  const dailyMinutes = minutesFromHours(asText(formData.get("daily_hours")));
+  const flexible = asText(formData.get("flexible_agreed")) === "yes";
+  const agreementRef = asText(formData.get("agreement_reference"));
+  if (!siteId || !employeeId || !parseMonth(month) || !effectiveWeek) {
+    redirectWithMessage(returnTo, "error", "Trabajador, sede, mes o lunes de vigencia inválidos.");
+  }
+  if (weeklyMinutes === null || weeklyMinutes < 60 || weeklyMinutes > 42 * 60 ||
+      dailyMinutes === null || dailyMinutes < 60 || dailyMinutes > (flexible ? 9 : 8) * 60) {
+    redirectWithMessage(returnTo, "error", "La jornada pactada debe indicar hasta 42 h por semana y 8 h diarias, o hasta 9 h con acuerdo flexible.");
+  }
+  if (agreementRef.length < 6 || agreementRef.length > 240) {
+    redirectWithMessage(returnTo, "error", "Indica una referencia documental verificable del acuerdo (6 a 240 caracteres).");
+  }
+
+  const { user, supabase } = await requireLaborRecordAuthority(employeeId, siteId, returnTo);
+  const { error } = await supabase.from("viso_labor_terms").insert({
+    employee_id: employeeId,
+    effective_week: effectiveWeek,
+    ordinary_weekly_minutes: weeklyMinutes,
+    ordinary_daily_minutes: dailyMinutes,
+    flexible_daily_agreement: flexible,
+    agreement_reference: agreementRef,
+    recorded_by: user.id,
+  });
+  if (error) {
+    redirectWithMessage(
+      returnTo,
+      "error",
+      error.code === "23505"
+        ? "Ya existe una jornada registrada para ese trabajador y lunes. No se sobrescribirá la evidencia; selecciona una nueva vigencia."
+        : "No se pudo registrar la jornada pactada. Verifica el contrato y vuelve a intentarlo.",
+    );
+  }
+  revalidatePath("/staff/schedule/month");
+  redirectWithMessage(returnTo, "ok", "Jornada pactada registrada con vigencia y trazabilidad; los registros anteriores se conservan.");
+}
+
+export async function recordWeeklyOvertimeDecisionAction(formData: FormData) {
+  const employeeId = asText(formData.get("employee_id"));
+  const siteId = asText(formData.get("site_id"));
+  const month = asText(formData.get("month"));
+  const returnTo = buildMonthReturnTo(siteId, month);
+  const weekStart = parseIsoMonday(asText(formData.get("week_start")));
+  const decision = asText(formData.get("decision"));
+  const minutes = decision === "revoke"
+    ? 0
+    : minutesFromHours(asText(formData.get("authorized_hours")));
+  const reason = asText(formData.get("reason"));
+  const approvalRef = asText(formData.get("approval_reference"));
+  if (!siteId || !employeeId || !parseMonth(month) || !weekStart ||
+      !["approve", "revoke"].includes(decision)) {
+    redirectWithMessage(returnTo, "error", "Datos de autorización semanales incompletos o inválidos.");
+  }
+  if (minutes === null || (decision === "approve" && (minutes < 1 || minutes > 12 * 60))) {
+    redirectWithMessage(returnTo, "error", "Las horas extra autorizadas deben estar entre 1 minuto y 12 horas semanales.");
+  }
+  if (reason.length < 12 || reason.length > 500 ||
+      approvalRef.length < 6 || approvalRef.length > 240) {
+    redirectWithMessage(returnTo, "error", "Registra un motivo (12–500 caracteres) y soporte documental (6–240 caracteres).");
+  }
+
+  const { user, supabase } = await requireLaborRecordAuthority(employeeId, siteId, returnTo, weekStart);
+  const { error } = await supabase.from("viso_weekly_overtime_decisions").insert({
+    employee_id: employeeId,
+    week_start: weekStart,
+    decision,
+    authorized_minutes: minutes,
+    reason,
+    approval_reference: approvalRef,
+    recorded_by: user.id,
+  });
+  if (error) {
+    redirectWithMessage(returnTo, "error", "No se pudo registrar la decisión. Comprueba que el trabajador tenga jornada vigente.");
+  }
+  revalidatePath("/staff/schedule/month");
+  redirectWithMessage(
+    returnTo,
+    "ok",
+    decision === "revoke"
+      ? "Autorización revocada con registro histórico; no se elimina el horario publicado."
+      : "Horas extra autorizadas para esa semana, registradas con responsable y soporte.",
+  );
 }

@@ -1,0 +1,37 @@
+name: VISO production overtime hotfix QA
+
+on:
+  push:
+    branches:
+      - hotfix/viso-prod-overtime-20261102
+permissions:
+  contents: read
+
+jobs:
+  verify-overtime-hotfix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+      - name: Install pinned dependencies
+        run: npm ci --no-audit --no-fund
+      - name: "Regression: monthly reference and publish checks"
+        run: node --test scripts/quality/viso-monthly-overtime-hotfix.test.mjs
+      - name: "Projection rules: weeks and multiple sites"
+        run: node --experimental-strip-types --test scripts/quality/viso-overtime-projection.test.mjs
+      - name: "Labor terms: weekly authorization, revocations and site isolation"
+        run: node --experimental-strip-types --test scripts/quality/viso-labor-readiness.test.mjs
+      - name: Verify TypeScript
+        run: npm run typecheck
+      - name: Verify targeted ESLint
+        run: npx eslint src/app/staff/schedule/month/constants.ts src/app/staff/schedule/month/page.tsx src/app/staff/schedule/month/actions.ts src/app/staff/schedule/month/block-actions.ts src/app/staff/schedule/month/labor-readiness.ts src/app/staff/schedule/month/labor-terms-panel.tsx src/components/viso/monthly-shift-builder.tsx
+      - name: Build Next.js
+        run: npm run build

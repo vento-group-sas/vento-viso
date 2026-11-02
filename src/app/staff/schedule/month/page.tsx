@@ -32,9 +32,16 @@ import {
   publishMonthAction,
 } from "./actions";
 import {
-  MONTHLY_SCHEDULE_LIMIT_MINUTES,
+  MONTHLY_SCHEDULE_REFERENCE_MINUTES,
   MONTHLY_SCHEDULE_WARNING_MINUTES,
 } from "./constants";
+import { projectMonthlyPotentialOvertime } from "./overtime-projection";
+import { LaborTermsPanel } from "./labor-terms-panel";
+import {
+  evaluateLaborPublication,
+  type LaborTermsRow,
+  type OvertimeDecisionRow,
+} from "./labor-readiness";
 
 export const dynamic = "force-dynamic";
 
@@ -76,18 +83,18 @@ function formatHours(minutes: number) {
 }
 
 function getMonthStatus(totalMinutes: number) {
-  if (totalMinutes > MONTHLY_SCHEDULE_LIMIT_MINUTES) {
+  if (totalMinutes > MONTHLY_SCHEDULE_REFERENCE_MINUTES) {
     return {
-      label: `Exceso ${formatHours(totalMinutes - MONTHLY_SCHEDULE_LIMIT_MINUTES)}`,
-      totalClass: "border-red-300 bg-red-50 text-red-800",
-      barClass: "bg-red-500",
-      rowClass: "bg-red-50/45",
-      shiftClass: "ring-1 ring-red-300",
+      label: `Sobre referencia ${formatHours(totalMinutes - MONTHLY_SCHEDULE_REFERENCE_MINUTES)} (revisar)`,
+      totalClass: "border-amber-300 bg-amber-50 text-amber-900",
+      barClass: "bg-amber-500",
+      rowClass: "bg-amber-50/45",
+      shiftClass: "ring-1 ring-amber-300",
     };
   }
   if (totalMinutes >= MONTHLY_SCHEDULE_WARNING_MINUTES) {
     return {
-      label: "Cerca del límite",
+      label: "Cerca de la referencia",
       totalClass: "border-amber-300 bg-amber-50 text-amber-800",
       barClass: "bg-amber-500",
       rowClass: "bg-amber-50/30",
@@ -95,7 +102,7 @@ function getMonthStatus(totalMinutes: number) {
     };
   }
   return {
-    label: "Dentro del límite",
+    label: "Bajo la referencia mensual",
     totalClass: "border-emerald-200 bg-emerald-50 text-emerald-800",
     barClass: "bg-emerald-500",
     rowClass: "",
@@ -124,6 +131,13 @@ export default async function StaffScheduleMonthPage({
   const monthEnd = endOfMonth(selectedMonth);
   const monthStartIso = isoDate(monthStart);
   const monthEndIso = isoDate(monthEnd);
+  // La semana de trabajo completa puede empezar/terminar fuera de este mes.
+  const firstFullWeekDay = addDays(monthStart, -((monthStart.getDay() + 6) % 7));
+  const lastFullWeekDay = addDays(monthEnd, (7 - monthEnd.getDay()) % 7);
+  const weekStarts: string[] = [];
+  for (let week = firstFullWeekDay; week <= lastFullWeekDay; week = addDays(week, 7)) {
+    weekStarts.push(isoDate(week));
+  }
   const monthDays = Array.from({ length: monthEnd.getDate() }, (_, index) => {
     const date = addDays(monthStart, index);
     return {
@@ -156,6 +170,11 @@ export default async function StaffScheduleMonthPage({
       : (operationalSites[0]?.id ?? "");
   const selectedSite =
     operationalSites.find((site) => site.id === selectedSiteId) ?? null;
+  // El selector puede escoger una sede por defecto, distinta a sp.site_id.
+  // Antes de leer términos laborales de esa sede debe autorizarse su contexto real.
+  if (selectedSiteId) {
+    await requireStaffScheduleAccess("/staff/schedule/month", selectedSiteId);
+  }
 
   const [directEmployeesRes, linkedEmployeesRes, shiftsRes, matrixRes, profilesRes] =
     await Promise.all([
@@ -243,11 +262,45 @@ export default async function StaffScheduleMonthPage({
             "id,employee_id,shift_date,start_time,end_time,shift_kind,operational_role,show_end_as_close,break_minutes,status,notes,site_id,area_id,checkin_site_id,checkout_site_id,published_at",
           )
           .in("employee_id", employeeIds)
-          .gte("shift_date", monthStartIso)
-          .lte("shift_date", monthEndIso)
+          .gte("shift_date", isoDate(firstFullWeekDay))
+          .lte("shift_date", isoDate(lastFullWeekDay))
       : { data: [], error: null };
   const allSiteMonthShiftsData = allSiteMonthResult.data ?? [];
   const allSiteMonthShiftsError = allSiteMonthResult.error;
+  const [termsResult, decisionsResult] = employeeIds.length > 0
+    ? await Promise.all([
+        supabase.from("viso_labor_terms")
+          .select("employee_id,effective_week,ordinary_weekly_minutes,ordinary_daily_minutes,flexible_daily_agreement")
+          .in("employee_id", employeeIds)
+          .lte("effective_week", isoDate(lastFullWeekDay)),
+        supabase.from("viso_weekly_overtime_decisions")
+          .select("id,employee_id,week_start,decision,authorized_minutes,recorded_at")
+          .in("employee_id", employeeIds)
+          .gte("week_start", isoDate(firstFullWeekDay))
+          .lte("week_start", isoDate(lastFullWeekDay)),
+      ])
+    : [{ data: [], error: null }, { data: [], error: null }];
+  const laborTerms = (termsResult.data ?? []) as LaborTermsRow[];
+  const overtimeDecisions = (decisionsResult.data ?? []) as OvertimeDecisionRow[];
+  const laborDataError = termsResult.error?.message ?? decisionsResult.error?.message ?? null;
+  const laborReadiness = laborDataError || allSiteMonthShiftsError
+    ? []
+    : evaluateLaborPublication(
+        allSiteMonthShiftsData as ShiftRow[],
+        laborTerms,
+        overtimeDecisions,
+        selectedSiteId,
+        monthStartIso,
+        monthEndIso,
+        getShiftMinutes,
+      );
+  const laborBlocked = laborReadiness.some((week) => week.state !== "ready");
+  const projectedOvertimeByEmployee = projectMonthlyPotentialOvertime(
+    allSiteMonthShiftsData as ShiftRow[],
+    monthStartIso,
+    monthEndIso,
+    getShiftMinutes,
+  );
 
   const totalsByEmployee = new Map<
     string,
@@ -258,6 +311,7 @@ export default async function StaffScheduleMonthPage({
   }
   for (const shift of (allSiteMonthShiftsData ?? []) as ShiftRow[]) {
     if (shift.status === "cancelled") continue;
+    if (shift.shift_date < monthStartIso || shift.shift_date > monthEndIso) continue;
     const minutes = getShiftMinutes(shift);
     const totals = totalsByEmployee.get(shift.employee_id) ?? {
       total: 0,
@@ -335,17 +389,17 @@ export default async function StaffScheduleMonthPage({
     year: "numeric",
   });
   const draftCount = shifts.filter((shift) => !shift.published_at).length;
-  const exceededEmployees = employees.filter(
+  const employeesAboveReference = employees.filter(
     (employee) =>
       (totalsByEmployee.get(employee.id)?.total ?? 0) >
-      MONTHLY_SCHEDULE_LIMIT_MINUTES,
+      MONTHLY_SCHEDULE_REFERENCE_MINUTES,
   );
 
   return (
     <div className="space-y-6">
       <PageHeader
         title="Horario mensual"
-        subtitle="Planifica todos los días del mes y controla el límite visible de 186 horas por trabajador."
+        subtitle="Programa los turnos del mes. Referencia salarial 2026: 210 h; no es un tope de publicación ni la liquidación de horas extra."
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Link href="/staff" className="ui-btn ui-btn--ghost">
@@ -386,17 +440,42 @@ export default async function StaffScheduleMonthPage({
         </div>
       ) : null}
 
-      {exceededEmployees.length > 0 ? (
-        <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900">
-          <div className="font-semibold">Publicación bloqueada por exceso mensual</div>
+      {employeesAboveReference.length > 0 ? (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <div className="font-semibold">Horas sobre la referencia mensual: requieren revisión, no bloquean por sí solas</div>
           <div className="mt-1">
-            {exceededEmployees
+            {employeesAboveReference
               .map((employee) => {
                 const minutes = totalsByEmployee.get(employee.id)?.total ?? 0;
-                return `${employee.full_name ?? employee.alias ?? employee.id}: ${formatHours(minutes)} (+${formatHours(minutes - MONTHLY_SCHEDULE_LIMIT_MINUTES)})`;
+                return `${employee.full_name ?? employee.alias ?? employee.id}: ${formatHours(minutes)} (+${formatHours(minutes - MONTHLY_SCHEDULE_REFERENCE_MINUTES)})`;
               })
               .join(" · ")}
           </div>
+          <p className="mt-2 text-xs">
+            El valor de 210 h es referencia salarial, no clasificación automática de horas extras.
+            Verifica la jornada pactada y los límites diarios y semanales antes de autorizar la publicación.
+          </p>
+        </div>
+      ) : null}
+
+      <LaborTermsPanel
+        employees={employees.map((employee) => ({
+          id: employee.id,
+          label: employee.full_name ?? employee.alias ?? employee.id,
+        }))}
+        terms={laborTerms}
+        decisions={overtimeDecisions}
+        readiness={laborReadiness}
+        weeks={weekStarts}
+        siteId={selectedSiteId}
+        month={selectedMonthKey}
+        dataError={laborDataError}
+      />
+      {laborBlocked ? (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          Hay semanas sin contrato, sin autorización suficiente o con límites excedidos.
+          Registra o corrige las jornadas y decisiones antes de publicar. La comprobación
+          definitiva ocurre en PostgreSQL.
         </div>
       ) : null}
 
@@ -408,7 +487,7 @@ export default async function StaffScheduleMonthPage({
               {selectedSite?.name ?? selectedSite?.code ?? "Sin sede"}
             </div>
             <p className="mt-1 text-sm text-[var(--ui-muted)]">
-              Los turnos nuevos quedan en borrador. Se permite exceder 186 h para ajustar el plan, pero no publicarlo.
+              Los turnos nuevos quedan en borrador. Una cifra mensual no sustituye los controles de jornada ordinaria pactada, descansos y horas extra.
             </p>
           </div>
 
@@ -477,19 +556,14 @@ export default async function StaffScheduleMonthPage({
                 <input type="hidden" name="site_id" value={selectedSiteId} />
                 <input type="hidden" name="month" value={selectedMonthKey} />
                 <input type="hidden" name="return_to" value={returnTo} />
+                <label className="mb-3 flex items-start gap-2 text-xs text-[var(--ui-muted)]">
+                  <input type="checkbox" name="hours_reviewed" value="yes" required className="mt-0.5" />
+                  <span>Confirmo que revisé la jornada pactada, los descansos y la autorización de horas extra de los trabajadores incluidos. Este horario no liquida horas trabajadas.</span>
+                </label>
                 <button
                   type="submit"
                   className="ui-btn ui-btn--brand"
-                  disabled={
-                    draftCount === 0 ||
-                    exceededEmployees.length > 0 ||
-                    Boolean(allSiteMonthShiftsError)
-                  }
-                  title={
-                    exceededEmployees.length > 0
-                      ? "Corrige los excesos antes de publicar"
-                      : undefined
-                  }
+                  disabled={draftCount === 0 || Boolean(allSiteMonthShiftsError) || Boolean(laborDataError) || laborBlocked}
                 >
                   Publicar mes
                 </button>
@@ -523,7 +597,7 @@ export default async function StaffScheduleMonthPage({
           }))}
           defaultEmployeeId={defaultEmployeeId}
           defaultDate={defaultDate}
-          limitMinutes={MONTHLY_SCHEDULE_LIMIT_MINUTES}
+          referenceMinutes={MONTHLY_SCHEDULE_REFERENCE_MINUTES}
           warningMinutes={MONTHLY_SCHEDULE_WARNING_MINUTES}
         />
       ) : null}
@@ -605,7 +679,7 @@ export default async function StaffScheduleMonthPage({
                   const progress = Math.min(
                     100,
                     Math.round(
-                      (totals.total / MONTHLY_SCHEDULE_LIMIT_MINUTES) * 100,
+                      (totals.total / MONTHLY_SCHEDULE_REFERENCE_MINUTES) * 100,
                     ),
                   );
                   const employeeName =
@@ -722,7 +796,7 @@ export default async function StaffScheduleMonthPage({
                             <span className="text-base font-bold">
                               {formatHours(totals.total)}
                             </span>
-                            <span className="text-[10px] font-semibold">/ 186 h</span>
+                            <span className="text-[10px] font-semibold">ref. 210 h</span>
                           </div>
                           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/80">
                             <div
@@ -733,6 +807,17 @@ export default async function StaffScheduleMonthPage({
                           <div className="mt-2 text-[10px] font-semibold">
                             {status.label}
                           </div>
+                          <div className="mt-1 text-[10px]">
+                            Hasta referencia salarial: {formatHours(Math.min(totals.total, MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
+                            {" · "}Sobre referencia: {formatHours(Math.max(0, totals.total - MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
+                          </div>
+                          <div className="mt-1 text-[10px] font-semibold">
+                            Ordinarias de referencia semanal: {formatHours(projectedOvertimeByEmployee.get(employee.id)?.ordinaryReferenceMinutes ?? 0)}
+                            {" · "}Posibles extras: {formatHours(projectedOvertimeByEmployee.get(employee.id)?.possibleExtraMinutes ?? 0)}
+                          </div>
+                          <p className="mt-1 text-[9px] opacity-75">
+                            Proyección general sobre 42 h/semana de todas las sedes. Usa la sección «Jornadas pactadas» para validar los límites de cada trabajador; esto no es una liquidación.
+                          </p>
                           <div className="mt-1 text-[9px] opacity-75">
                             Todas las sedes · Pub. {formatHours(totals.published)} · Borr. {formatHours(totals.draft)}
                           </div>
