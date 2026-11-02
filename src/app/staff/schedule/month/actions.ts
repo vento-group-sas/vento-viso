@@ -4,6 +4,7 @@ import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
 
 import { notifyShiftChange } from "@/lib/anima/shift-notify";
+import { requireAppAccess } from "@/lib/auth/guard";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 import {
@@ -514,6 +515,15 @@ export async function publishMonthAction(formData: FormData) {
     asText(formData.get("return_to")) || buildMonthReturnTo(siteId, month);
 
   const { user } = await requireStaffScheduleAccess(returnTo, siteId);
+  // Publicar turnos (incluidas posibles horas extra) requiere permiso real
+  // de administración. staff.schedule.view sólo permite visualizar horarios.
+  await requireAppAccess({
+    appId: "viso",
+    returnTo,
+    permissionCode: "staff.manage",
+    siteId,
+    allowPermissionAccess: true,
+  });
   if (asText(formData.get("hours_reviewed")) !== "yes") {
     redirectWithMessage(returnTo, "error", "Confirma la revisión de jornada pactada, descansos y horas extra antes de publicar.");
   }
