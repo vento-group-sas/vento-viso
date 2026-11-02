@@ -35,6 +35,7 @@ import {
   MONTHLY_SCHEDULE_REFERENCE_MINUTES,
   MONTHLY_SCHEDULE_WARNING_MINUTES,
 } from "./constants";
+import { projectMonthlyPotentialOvertime } from "./overtime-projection";
 
 export const dynamic = "force-dynamic";
 
@@ -124,6 +125,9 @@ export default async function StaffScheduleMonthPage({
   const monthEnd = endOfMonth(selectedMonth);
   const monthStartIso = isoDate(monthStart);
   const monthEndIso = isoDate(monthEnd);
+  // La semana de trabajo completa puede empezar/terminar fuera de este mes.
+  const firstFullWeekDay = addDays(monthStart, -((monthStart.getDay() + 6) % 7));
+  const lastFullWeekDay = addDays(monthEnd, (7 - monthEnd.getDay()) % 7);
   const monthDays = Array.from({ length: monthEnd.getDate() }, (_, index) => {
     const date = addDays(monthStart, index);
     return {
@@ -243,11 +247,17 @@ export default async function StaffScheduleMonthPage({
             "id,employee_id,shift_date,start_time,end_time,shift_kind,operational_role,show_end_as_close,break_minutes,status,notes,site_id,area_id,checkin_site_id,checkout_site_id,published_at",
           )
           .in("employee_id", employeeIds)
-          .gte("shift_date", monthStartIso)
-          .lte("shift_date", monthEndIso)
+          .gte("shift_date", isoDate(firstFullWeekDay))
+          .lte("shift_date", isoDate(lastFullWeekDay))
       : { data: [], error: null };
   const allSiteMonthShiftsData = allSiteMonthResult.data ?? [];
   const allSiteMonthShiftsError = allSiteMonthResult.error;
+  const projectedOvertimeByEmployee = projectMonthlyPotentialOvertime(
+    allSiteMonthShiftsData as ShiftRow[],
+    monthStartIso,
+    monthEndIso,
+    getShiftMinutes,
+  );
 
   const totalsByEmployee = new Map<
     string,
@@ -258,6 +268,7 @@ export default async function StaffScheduleMonthPage({
   }
   for (const shift of (allSiteMonthShiftsData ?? []) as ShiftRow[]) {
     if (shift.status === "cancelled") continue;
+    if (shift.shift_date < monthStartIso || shift.shift_date > monthEndIso) continue;
     const minutes = getShiftMinutes(shift);
     const totals = totalsByEmployee.get(shift.employee_id) ?? {
       total: 0,
@@ -733,9 +744,16 @@ export default async function StaffScheduleMonthPage({
                             {status.label}
                           </div>
                           <div className="mt-1 text-[10px]">
-                            Hasta referencia: {formatHours(Math.min(totals.total, MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
+                            Hasta referencia salarial: {formatHours(Math.min(totals.total, MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
                             {" · "}Sobre referencia: {formatHours(Math.max(0, totals.total - MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
                           </div>
+                          <div className="mt-1 text-[10px] font-semibold">
+                            Ordinarias de referencia semanal: {formatHours(projectedOvertimeByEmployee.get(employee.id)?.ordinaryReferenceMinutes ?? 0)}
+                            {" · "}Posibles extras: {formatHours(projectedOvertimeByEmployee.get(employee.id)?.possibleExtraMinutes ?? 0)}
+                          </div>
+                          <p className="mt-1 text-[9px] opacity-75">
+                            Proyección sobre 42 h/semana de todas las sedes. La jornada pactada y los excesos diarios pueden cambiar el resultado; no es liquidación.
+                          </p>
                           <div className="mt-1 text-[9px] opacity-75">
                             Todas las sedes · Pub. {formatHours(totals.published)} · Borr. {formatHours(totals.draft)}
                           </div>
