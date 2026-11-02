@@ -4,14 +4,8 @@ on:
   push:
     branches:
       - hotfix/viso-prod-overtime-20261102
-  workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: viso-prod-overtime-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   verify-overtime-hotfix:
@@ -31,6 +25,8 @@ jobs:
         run: npm ci --no-audit --no-fund
       - name: Regression: monthly reference and publish checks
         run: node --test scripts/quality/viso-monthly-overtime-hotfix.test.mjs
+      - name: Projection rules: weeks and multiple sites
+        run: node --experimental-strip-types --test scripts/quality/viso-overtime-projection.test.mjs
       - name: Verify TypeScript
         run: npm run typecheck
       - name: Verify targeted ESLint
