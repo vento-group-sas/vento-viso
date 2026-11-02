@@ -80,11 +80,11 @@ export function LaborTermsPanel({
           <div className="grid grid-cols-2 gap-3">
             <label className="block text-xs font-medium">Horas ordinarias/semana
               <input type="number" name="weekly_hours" min="1" max="42" step="0.25"
-                defaultValue="42" required className="ui-input mt-1 w-full" />
+                placeholder="Ej. 36" required className="ui-input mt-1 w-full" />
             </label>
             <label className="block text-xs font-medium">Horas ordinarias/día
               <input type="number" name="daily_hours" min="1" max="9" step="0.25"
-                defaultValue="8" required className="ui-input mt-1 w-full" />
+                placeholder="Ej. 8" required className="ui-input mt-1 w-full" />
             </label>
           </div>
           <label className="flex items-start gap-2 text-xs">
@@ -119,9 +119,9 @@ export function LaborTermsPanel({
               {weeks.map((week) => <option key={week} value={week}>{week}</option>)}
             </select>
           </label>
-          <label className="block text-xs font-medium">Máximo autorizado para esa semana (horas)
+          <label className="block text-xs font-medium">Horas autorizadas (solo para aprobar; máximo 12)
             <input type="number" name="authorized_hours" min="0.25" max="12" step="0.25"
-              defaultValue="2" required className="ui-input mt-1 w-full" />
+              placeholder="Ej. 4" className="ui-input mt-1 w-full" />
           </label>
           <label className="block text-xs font-medium">Motivo del trabajo suplementario
             <textarea name="reason" minLength={12} maxLength={500} required rows={2}
