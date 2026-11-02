@@ -23,9 +23,9 @@ jobs:
           cache: npm
       - name: Install pinned dependencies
         run: npm ci --no-audit --no-fund
-      - name: Regression: monthly reference and publish checks
+      - name: "Regression: monthly reference and publish checks"
         run: node --test scripts/quality/viso-monthly-overtime-hotfix.test.mjs
-      - name: Projection rules: weeks and multiple sites
+      - name: "Projection rules: weeks and multiple sites"
         run: node --experimental-strip-types --test scripts/quality/viso-overtime-projection.test.mjs
       - name: Verify TypeScript
         run: npm run typecheck
