@@ -22,7 +22,7 @@ export type LaborShift = {
   employee_id: string;
   site_id: string;
   shift_date: string;
-  published_at: string | null;
+  published_at?: string | null;
   status: string;
   shift_kind?: string | null;
 };
