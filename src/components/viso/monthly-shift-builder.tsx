@@ -48,7 +48,7 @@ type MonthlyShiftBuilderProps = {
   days: MonthDayOption[];
   defaultEmployeeId: string;
   defaultDate?: string;
-  limitMinutes: number;
+  referenceMinutes: number;
   warningMinutes: number;
 };
 
@@ -133,7 +133,7 @@ export function MonthlyShiftBuilder({
   days,
   defaultEmployeeId,
   defaultDate,
-  limitMinutes,
+  referenceMinutes,
   warningMinutes,
 }: MonthlyShiftBuilderProps) {
   const fallbackEmployee = employees[0] ?? null;
@@ -191,19 +191,19 @@ export function MonthlyShiftBuilder({
   );
 
   const projectionState =
-    projectedMinutes > limitMinutes
+    projectedMinutes > referenceMinutes
       ? {
-          className: "border-red-300 bg-red-50 text-red-900",
-          status: `Excede por ${formatHours(projectedMinutes - limitMinutes)}. Se guardará únicamente como borrador.`,
+          className: "border-amber-300 bg-amber-50 text-amber-900",
+          status: `Sobre referencia salarial: ${formatHours(projectedMinutes - referenceMinutes)} por revisar. Borrador permitido.`,
         }
       : projectedMinutes >= warningMinutes
         ? {
             className: "border-amber-300 bg-amber-50 text-amber-900",
-            status: `Cerca del límite · Restan ${formatHours(limitMinutes - projectedMinutes)}`,
+            status: `Cerca de referencia · ${formatHours(referenceMinutes - projectedMinutes)} por debajo`,
           }
         : {
             className: "border-emerald-200 bg-emerald-50 text-emerald-900",
-            status: `Dentro del límite · Restan ${formatHours(limitMinutes - projectedMinutes)}`,
+            status: "Dentro de referencia salarial · No determina horas extra legales",
           };
 
   function updateBlock(blockId: string, patch: Partial<ShiftBlock>) {
@@ -712,7 +712,7 @@ export function MonthlyShiftBuilder({
               <div>
                 <div className="text-xs font-semibold uppercase opacity-70">Proyectado</div>
                 <div className="mt-1 text-xl font-bold">
-                  {formatHours(projectedMinutes)} / {formatHours(limitMinutes)}
+                  {formatHours(projectedMinutes)} · ref. {formatHours(referenceMinutes)}
                 </div>
               </div>
               <div>
