@@ -27,9 +27,11 @@ jobs:
         run: node --test scripts/quality/viso-monthly-overtime-hotfix.test.mjs
       - name: "Projection rules: weeks and multiple sites"
         run: node --experimental-strip-types --test scripts/quality/viso-overtime-projection.test.mjs
+      - name: "Labor terms: weekly authorization, revocations and site isolation"
+        run: node --experimental-strip-types --test scripts/quality/viso-labor-readiness.test.mjs
       - name: Verify TypeScript
         run: npm run typecheck
       - name: Verify targeted ESLint
-        run: npx eslint src/app/staff/schedule/month/constants.ts src/app/staff/schedule/month/page.tsx src/app/staff/schedule/month/actions.ts src/app/staff/schedule/month/block-actions.ts src/components/viso/monthly-shift-builder.tsx
+        run: npx eslint src/app/staff/schedule/month/constants.ts src/app/staff/schedule/month/page.tsx src/app/staff/schedule/month/actions.ts src/app/staff/schedule/month/block-actions.ts src/app/staff/schedule/month/labor-readiness.ts src/app/staff/schedule/month/labor-terms-panel.tsx src/components/viso/monthly-shift-builder.tsx
       - name: Build Next.js
         run: npm run build
