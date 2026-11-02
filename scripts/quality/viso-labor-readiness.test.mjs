@@ -82,8 +82,13 @@ test("Exceso diario de 9h requiere 1h autorizada aun sin llegar a 42h semanales"
 });
 
 test("Combina published de otra sede y borrador de sede activa", () => {
-  const [week] = evaluate([shift(iso, 32, "site-b", "published"), shift("2026-11-06", 8)],
-    [term("worker")]);
+  const [week] = evaluate([
+    shift("2026-11-02", 8, "site-b", "published"),
+    shift("2026-11-03", 8, "site-b", "published"),
+    shift("2026-11-04", 8, "site-b", "published"),
+    shift("2026-11-05", 8, "site-b", "published"),
+    shift("2026-11-06", 8),
+  ], [term("worker")]);
   assert.equal(week.scheduledMinutes, 40 * 60);
   assert.equal(week.requiredExtraMinutes, 4 * 60);
 });
@@ -118,7 +123,11 @@ test("Sin borradores de la sede objetivo no inventa bloqueos a la publicación",
 
 test("Cruce mensual octubre-noviembre usa la misma semana ISO", () => {
   const rows = [
-    shift("2026-10-30", 36, "site-b", "published"),
+    shift("2026-10-26", 8, "site-b", "published"),
+    shift("2026-10-27", 8, "site-b", "published"),
+    shift("2026-10-28", 8, "site-b", "published"),
+    shift("2026-10-29", 8, "site-b", "published"),
+    shift("2026-10-30", 4, "site-b", "published"),
     shift("2026-11-01", 2),
   ];
   const terms = [{ ...term("worker"), effective_week: "2026-10-26" }];
