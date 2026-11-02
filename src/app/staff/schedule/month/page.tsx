@@ -32,7 +32,7 @@ import {
   publishMonthAction,
 } from "./actions";
 import {
-  MONTHLY_SCHEDULE_LIMIT_MINUTES,
+  MONTHLY_SCHEDULE_REFERENCE_MINUTES,
   MONTHLY_SCHEDULE_WARNING_MINUTES,
 } from "./constants";
 
@@ -76,18 +76,18 @@ function formatHours(minutes: number) {
 }
 
 function getMonthStatus(totalMinutes: number) {
-  if (totalMinutes > MONTHLY_SCHEDULE_LIMIT_MINUTES) {
+  if (totalMinutes > MONTHLY_SCHEDULE_REFERENCE_MINUTES) {
     return {
-      label: `Exceso ${formatHours(totalMinutes - MONTHLY_SCHEDULE_LIMIT_MINUTES)}`,
-      totalClass: "border-red-300 bg-red-50 text-red-800",
-      barClass: "bg-red-500",
-      rowClass: "bg-red-50/45",
-      shiftClass: "ring-1 ring-red-300",
+      label: `Sobre referencia ${formatHours(totalMinutes - MONTHLY_SCHEDULE_REFERENCE_MINUTES)} (revisar)`,
+      totalClass: "border-amber-300 bg-amber-50 text-amber-900",
+      barClass: "bg-amber-500",
+      rowClass: "bg-amber-50/45",
+      shiftClass: "ring-1 ring-amber-300",
     };
   }
   if (totalMinutes >= MONTHLY_SCHEDULE_WARNING_MINUTES) {
     return {
-      label: "Cerca del límite",
+      label: "Cerca de la referencia",
       totalClass: "border-amber-300 bg-amber-50 text-amber-800",
       barClass: "bg-amber-500",
       rowClass: "bg-amber-50/30",
@@ -95,7 +95,7 @@ function getMonthStatus(totalMinutes: number) {
     };
   }
   return {
-    label: "Dentro del límite",
+    label: "Bajo la referencia mensual",
     totalClass: "border-emerald-200 bg-emerald-50 text-emerald-800",
     barClass: "bg-emerald-500",
     rowClass: "",
@@ -335,17 +335,17 @@ export default async function StaffScheduleMonthPage({
     year: "numeric",
   });
   const draftCount = shifts.filter((shift) => !shift.published_at).length;
-  const exceededEmployees = employees.filter(
+  const employeesAboveReference = employees.filter(
     (employee) =>
       (totalsByEmployee.get(employee.id)?.total ?? 0) >
-      MONTHLY_SCHEDULE_LIMIT_MINUTES,
+      MONTHLY_SCHEDULE_REFERENCE_MINUTES,
   );
 
   return (
     <div className="space-y-6">
       <PageHeader
         title="Horario mensual"
-        subtitle="Planifica todos los días del mes y controla el límite visible de 186 horas por trabajador."
+        subtitle="Programa los turnos del mes. Referencia salarial 2026: 210 h; no es un tope de publicación ni la liquidación de horas extra."
         actions={
           <div className="flex flex-wrap items-center gap-2">
             <Link href="/staff" className="ui-btn ui-btn--ghost">
@@ -386,19 +386,23 @@ export default async function StaffScheduleMonthPage({
         </div>
       ) : null}
 
-      {exceededEmployees.length > 0 ? (
-        <div className="rounded-xl border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900">
-          <div className="font-semibold">Publicación bloqueada por exceso mensual</div>
+      {employeesAboveReference.length > 0 ? (
+        <div className="rounded-xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <div className="font-semibold">Horas sobre la referencia mensual: requieren revisión, no bloquean por sí solas</div>
           <div className="mt-1">
-            {exceededEmployees
+            {employeesAboveReference
               .map((employee) => {
                 const minutes = totalsByEmployee.get(employee.id)?.total ?? 0;
-                return `${employee.full_name ?? employee.alias ?? employee.id}: ${formatHours(minutes)} (+${formatHours(minutes - MONTHLY_SCHEDULE_LIMIT_MINUTES)})`;
+                return `${employee.full_name ?? employee.alias ?? employee.id}: ${formatHours(minutes)} (+${formatHours(minutes - MONTHLY_SCHEDULE_REFERENCE_MINUTES)})`;
               })
               .join(" · ")}
           </div>
+          <p className="mt-2 text-xs">
+            El valor de 210 h es referencia salarial, no clasificación automática de horas extras.
+            Verifica la jornada pactada y los límites diarios y semanales antes de autorizar la publicación.
+          </p>
         </div>
-      ) : null}
+      ) : null>
 
       <div className="ui-panel space-y-4">
         <div className="grid gap-4 xl:grid-cols-[minmax(260px,1fr)_minmax(280px,380px)]">
@@ -408,7 +412,7 @@ export default async function StaffScheduleMonthPage({
               {selectedSite?.name ?? selectedSite?.code ?? "Sin sede"}
             </div>
             <p className="mt-1 text-sm text-[var(--ui-muted)]">
-              Los turnos nuevos quedan en borrador. Se permite exceder 186 h para ajustar el plan, pero no publicarlo.
+              Los turnos nuevos quedan en borrador. Una cifra mensual no sustituye los controles de jornada ordinaria pactada, descansos y horas extra.
             </p>
           </div>
 
@@ -477,19 +481,14 @@ export default async function StaffScheduleMonthPage({
                 <input type="hidden" name="site_id" value={selectedSiteId} />
                 <input type="hidden" name="month" value={selectedMonthKey} />
                 <input type="hidden" name="return_to" value={returnTo} />
+                <label className="mb-3 flex items-start gap-2 text-xs text-[var(--ui-muted)]">
+                  <input type="checkbox" name="hours_reviewed" value="yes" required className="mt-0.5" />
+                  <span>Confirmo que revisé la jornada pactada, los descansos y la autorización de horas extra de los trabajadores incluidos. Este horario no liquida horas trabajadas.</span>
+                </label>
                 <button
                   type="submit"
                   className="ui-btn ui-btn--brand"
-                  disabled={
-                    draftCount === 0 ||
-                    exceededEmployees.length > 0 ||
-                    Boolean(allSiteMonthShiftsError)
-                  }
-                  title={
-                    exceededEmployees.length > 0
-                      ? "Corrige los excesos antes de publicar"
-                      : undefined
-                  }
+                  disabled={draftCount === 0 || Boolean(allSiteMonthShiftsError)}
                 >
                   Publicar mes
                 </button>
@@ -523,7 +522,7 @@ export default async function StaffScheduleMonthPage({
           }))}
           defaultEmployeeId={defaultEmployeeId}
           defaultDate={defaultDate}
-          limitMinutes={MONTHLY_SCHEDULE_LIMIT_MINUTES}
+          referenceMinutes={MONTHLY_SCHEDULE_REFERENCE_MINUTES}
           warningMinutes={MONTHLY_SCHEDULE_WARNING_MINUTES}
         />
       ) : null}
@@ -605,7 +604,7 @@ export default async function StaffScheduleMonthPage({
                   const progress = Math.min(
                     100,
                     Math.round(
-                      (totals.total / MONTHLY_SCHEDULE_LIMIT_MINUTES) * 100,
+                      (totals.total / MONTHLY_SCHEDULE_REFERENCE_MINUTES) * 100,
                     ),
                   );
                   const employeeName =
@@ -722,7 +721,7 @@ export default async function StaffScheduleMonthPage({
                             <span className="text-base font-bold">
                               {formatHours(totals.total)}
                             </span>
-                            <span className="text-[10px] font-semibold">/ 186 h</span>
+                            <span className="text-[10px] font-semibold">ref. 210 h</span>
                           </div>
                           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/80">
                             <div
@@ -732,6 +731,10 @@ export default async function StaffScheduleMonthPage({
                           </div>
                           <div className="mt-2 text-[10px] font-semibold">
                             {status.label}
+                          </div>
+                          <div className="mt-1 text-[10px]">
+                            Hasta referencia: {formatHours(Math.min(totals.total, MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
+                            {" · "}Sobre referencia: {formatHours(Math.max(0, totals.total - MONTHLY_SCHEDULE_REFERENCE_MINUTES))}
                           </div>
                           <div className="mt-1 text-[9px] opacity-75">
                             Todas las sedes · Pub. {formatHours(totals.published)} · Borr. {formatHours(totals.draft)}
