@@ -64,3 +64,50 @@ test("VISO: publicar exige permiso staff.manage por sede además de acceso de vi
   assert.match(publish, /await requireAppAccess\(\{[\s\S]*?permissionCode: "staff.manage",[\s\S]*?siteId,[\s\S]*?\}\)/u);
   assert.ok(publish.indexOf('permissionCode: "staff.manage"') < publish.indexOf(".update({ published_at: publishedAt"), "la autorización debe anteceder la escritura");
 });
+
+test("VISO: las decisiones semanales requieren permisos en todas las sedes afectadas", () => {
+  const authority = monthActions.slice(monthActions.indexOf("async function requireLaborRecordAuthority("));
+  for (const part of [
+    'permissionCode: "staff.manage"',
+    'for (const assignedSiteId of siteIds)',
+    '.from("employee_sites")',
+    '.from("employee_shifts")',
+    '.eq("employee_id", employeeId)',
+    '.gte("shift_date", weekStart)',
+  ]) {
+    assert.ok(authority.includes(part), `No se validó ${part}`);
+  }
+});
+
+test("VISO: la jornada y autorización se registran con actor e historial", () => {
+  assert.ok(monthActions.includes("export async function registerLaborTermsAction(formData: FormData)"));
+  assert.ok(monthActions.includes("export async function recordWeeklyOvertimeDecisionAction(formData: FormData)"));
+  assert.ok(monthActions.includes('.from("viso_labor_terms").insert({'));
+  assert.ok(monthActions.includes('.from("viso_weekly_overtime_decisions").insert({'));
+  assert.ok((monthActions.match(/recorded_by: user.id/g) ?? []).length >= 2);
+  assert.ok(monthActions.includes("parseIsoMonday("));
+});
+
+test("VISO: pantalla bloquea publicación con datos laborales incompletos", () => {
+  assert.ok(page.includes("evaluateLaborPublication("));
+  assert.ok(page.includes("Boolean(laborDataError) || laborBlocked"));
+  assert.ok(page.includes('await requireStaffScheduleAccess("/staff/schedule/month", selectedSiteId)'));
+  const panel = source("src/app/staff/schedule/month/labor-terms-panel.tsx");
+  assert.ok(panel.includes("action={registerLaborTermsAction}"));
+  assert.ok(panel.includes("action={recordWeeklyOvertimeDecisionAction}"));
+  assert.ok(!panel.includes('defaultValue="42"') && !panel.includes('defaultValue="8"'));
+  assert.ok(!panel.includes("defaultValue={employees[0]?.id"));
+});
+
+test("VISO: solo el contrato vigente define posibles extras, no la referencia mensual", () => {
+  const projection = source("src/app/staff/schedule/month/labor-readiness.ts");
+  for (const part of [
+    "effective_week <= weekStart",
+    'state: "missing_terms"',
+    "activeTerms.ordinary_weekly_minutes + 720",
+    "recorded_at.localeCompare",
+    "targetDraft",
+  ]) {
+    assert.ok(projection.includes(part), `Invariante no satisfecha: ${part}`);
+  }
+});
