@@ -57,3 +57,10 @@ test("VISO: el hotfix NO sustituye autorización de extras ni protección SQL", 
   assert.match(page, /límites diarios y semanales/u);
   assert.match(monthActions, /requireStaffScheduleAccess/u);
 });
+
+test("VISO: publicar exige permiso staff.manage por sede además de acceso de visualización", () => {
+  const publish = monthActions.slice(monthActions.indexOf("export async function publishMonthAction"));
+  assert.match(publish, /await requireStaffScheduleAccess\(returnTo, siteId\)/u);
+  assert.match(publish, /await requireAppAccess\(\{[\s\S]*?permissionCode: "staff.manage",[\s\S]*?siteId,[\s\S]*?\}\)/u);
+  assert.ok(publish.indexOf('permissionCode: "staff.manage"') < publish.indexOf(".update({ published_at: publishedAt"), "la autorización debe anteceder la escritura");
+});
