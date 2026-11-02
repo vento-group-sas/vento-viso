@@ -8,7 +8,7 @@ export type OvertimeProjectionShift = {
   employee_id: string;
   shift_date: string;
   start_time: string;
-  shift_kind: string;
+  shift_kind?: string | null;
   status: string;
 };
 
