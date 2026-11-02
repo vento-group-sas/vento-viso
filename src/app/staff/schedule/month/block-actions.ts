@@ -19,7 +19,7 @@ import {
   type ShiftRow,
   type SiteOperationalRoleRow,
 } from "../helpers";
-import { MONTHLY_SCHEDULE_LIMIT_MINUTES } from "./constants";
+import { MONTHLY_SCHEDULE_REFERENCE_MINUTES } from "./constants";
 
 const MAX_MONTHLY_SHIFT_BLOCKS = 12;
 
@@ -493,18 +493,18 @@ export async function createMonthlyScheduleBlocksAction(formData: FormData) {
     .filter(Boolean)
     .join(" y ");
 
-  if (projectedMinutes > MONTHLY_SCHEDULE_LIMIT_MINUTES) {
-    const excessMinutes = projectedMinutes - MONTHLY_SCHEDULE_LIMIT_MINUTES;
+  if (projectedMinutes > MONTHLY_SCHEDULE_REFERENCE_MINUTES) {
+    const excessMinutes = projectedMinutes - MONTHLY_SCHEDULE_REFERENCE_MINUTES;
     redirectWithMessage(
       returnTo,
       "warning",
-      `${savedDetail} quedaron en borrador. ${employeeName} suma ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h y excede el límite mensual por ${(excessMinutes / 60).toFixed(1).replace(".", ",")} h. No podrá publicarse hasta corregirlo.`,
+      `${savedDetail} quedaron en borrador. ${employeeName} suma ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h; ${(excessMinutes / 60).toFixed(1).replace(".", ",")} h superan la referencia salarial mensual. La revisión de horas extra debe considerar jornada pactada y semanas completas; no existe un tope mensual fijo para publicar.`,
     );
   }
 
   redirectWithMessage(
     returnTo,
     "ok",
-    `${savedDetail} guardados en borrador. Total proyectado: ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h de 186 h.`,
+    `${savedDetail} guardados en borrador. Total proyectado: ${(projectedMinutes / 60).toFixed(1).replace(".", ",")} h (referencia salarial 210 h; no es un máximo legal).`,
   );
 }
