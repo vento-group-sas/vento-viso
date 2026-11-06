@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { redirect } from "next/navigation";
 
 import { PageHeader } from "@/components/vento/standard/page-header";
 import { Table, TableBody, TableCell, TableHead, TableHeaderCell, TableRow } from "@/components/vento/standard/table";
@@ -21,8 +22,6 @@ type EmployeeRow = {
   document_number: string | null;
   role: string | null;
   is_active: boolean | null;
-  site_id: string | null;
-  site?: SiteLite | SiteLite[] | null;
 };
 
 type EmployeeSiteLink = {
@@ -82,11 +81,11 @@ function attendanceLabel(status: AttendanceStatusRow | undefined) {
 }
 
 function deviceStatusLabel(device: SharedDeviceRow) {
+  if (device.activation_status === "revoked") return { label: "Revocado", tone: "" };
+  if (device.activation_status === "suspended") return { label: "Suspendido", tone: "ui-chip--warning" };
   if (!device.is_active) return { label: "Inactivo", tone: "" };
   if (device.activation_status === "active") return { label: "Activo", tone: "ui-chip--success" };
   if (device.activation_status === "pending_activation") return { label: "Pendiente", tone: "ui-chip--warning" };
-  if (device.activation_status === "suspended") return { label: "Suspendido", tone: "ui-chip--warning" };
-  if (device.activation_status === "revoked") return { label: "Revocado", tone: "" };
   return { label: "Borrador", tone: "" };
 }
 
@@ -109,39 +108,412 @@ function deviceTypeLabel(value: string | null | undefined) {
   }
 }
 
+
+const STAFF_READ_PERMISSION = "viso.workforce.employees.view";
+
+const isUuid = (value: string) =>
+  /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value);
+
+type DeviceTransition = "suspend" | "reactivate" | "revoke";
+
+function deviceNotice(kind: "updated" | "unchanged" | "denied" | "conflict" | "reconcile"): never {
+  redirect("/staff?tab=devices&status=all&device_notice=" + kind);
+}
+
+async function changeSharedDeviceState(formData: FormData) {
+  "use server";
+
+  const id = String(formData.get("device_id") ?? "").trim();
+  const transition = String(formData.get("transition") ?? "").trim() as DeviceTransition;
+  if (!isUuid(id) || !["suspend", "reactivate", "revoke"].includes(transition)) {
+    deviceNotice("denied");
+  }
+  if (transition === "revoke" && formData.get("confirm_revocation") !== "yes") {
+    deviceNotice("denied");
+  }
+
+  const access = await requireAppAccess({
+    appId: "viso",
+    returnTo: "/staff?tab=devices",
+    permissionCode: "staff.manage",
+  });
+  const operatorSiteId = String(access.siteId ?? "").trim();
+  if (access.operationalSession.isSharedDevice || !isUuid(operatorSiteId)) {
+    deviceNotice("denied");
+  }
+
+  const admin = createAdminClient();
+  const [{ data: operatorSite, error: operatorSiteError },
+    { data: device, error: deviceError }] = await Promise.all([
+    admin.from("employee_sites").select("employee_id")
+      .eq("employee_id", access.user.id).eq("site_id", operatorSiteId)
+      .eq("is_active", true).maybeSingle(),
+    admin.from("shared_operational_devices")
+      .select("id,code,auth_user_id,site_id,area_id,default_app_code,activation_status,is_active")
+      .eq("id", id).maybeSingle(),
+  ]);
+  if (operatorSiteError || !operatorSite || deviceError || !device ||
+      !isUuid(device.site_id) || !device.auth_user_id) {
+    deviceNotice("denied");
+  }
+
+  const { data: authorized, error: permissionError } = await access.supabase
+    .rpc("has_permission", {
+      p_permission_code: "viso.staff.manage",
+      p_site_id: device.site_id,
+      p_area_id: device.area_id,
+    });
+  if (permissionError || authorized !== true) deviceNotice("denied");
+
+  if (device.site_id !== operatorSiteId) {
+    // Effective permission in a foreign SITE is necessary, not sufficient.
+    // A GLOBAL grant must have provenance; never infer it from NULL-site RPC.
+    const { data: app, error: appError } = await admin
+      .from("apps").select("id").eq("code", "viso").maybeSingle();
+    if (appError || !app) deviceNotice("denied");
+    const { data: permission, error: grantError } = await admin
+      .from("app_permissions").select("id").eq("app_id", app.id)
+      .eq("code", "staff.manage").eq("is_active", true).maybeSingle();
+    if (grantError || !permission) deviceNotice("denied");
+
+    const [{ data: employeeGlobal, error: employeeError },
+      { data: roleGlobal, error: roleError }] = await Promise.all([
+      admin.from("employee_permissions").select("id")
+        .eq("employee_id", access.user.id).eq("permission_id", permission.id)
+        .eq("is_allowed", true).eq("scope_type", "global")
+        .is("scope_site_id", null).is("scope_area_id", null)
+        .is("scope_site_type", null).is("scope_area_kind", null)
+        .limit(1).maybeSingle(),
+      access.operationalSession.role
+        ? admin.from("role_permissions").select("permission_id")
+          .eq("role", access.operationalSession.role)
+          .eq("permission_id", permission.id).eq("is_allowed", true)
+          .or("scope_type.eq.global,scope_type.is.null")
+          .is("scope_site_id", null).is("scope_area_id", null)
+          .is("scope_site_type", null).is("scope_area_kind", null)
+          .limit(1).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
+    if (employeeError || roleError || (!employeeGlobal && !roleGlobal)) {
+      deviceNotice("denied");
+    }
+  }
+
+  // Only technical accounts provisioned as shared devices may be banned.
+  const { data: technicalAccount, error: authLookupError } =
+    await admin.auth.admin.getUserById(device.auth_user_id);
+  if (authLookupError || !technicalAccount.user ||
+      technicalAccount.user.app_metadata?.account_type !== "shared_operational_device" ||
+      technicalAccount.user.app_metadata?.device_code !== device.code) {
+    deviceNotice("reconcile");
+  }
+
+  const initial = String(device.activation_status);
+  const target = transition === "reactivate" ? "active"
+    : transition === "suspend" ? "suspended" : "revoked";
+  const eventType = transition === "reactivate"
+    ? "device.activated" : transition === "suspend"
+      ? "device.suspended" : "device.revoked";
+  const valid = transition === "reactivate"
+    ? initial === "suspended"
+    : transition === "suspend"
+      ? initial === "active" || initial === "pending_activation"
+      : initial === "active" || initial === "suspended" || initial === "pending_activation";
+  if (!valid) {
+    if (initial !== target) deviceNotice("conflict");
+    if (Boolean(device.is_active) !== (target === "active")) {
+      deviceNotice("reconcile");
+    }
+    // Already-active devices cannot produce a new activation event.
+    if (transition === "reactivate") deviceNotice("unchanged");
+    const { data: existingAudit, error: existingAuditError } = await admin
+      .from("shared_operational_device_events").select("id")
+      .eq("device_id", id).eq("event_type", eventType)
+      .order("occurred_at", { ascending: false }).limit(1).maybeSingle();
+    if (existingAuditError) deviceNotice("reconcile");
+    if (existingAudit) deviceNotice("unchanged");
+    // A previous attempt may have changed state before recording an event.
+  }
+
+  const oldActive = Boolean(device.is_active);
+  const nextActive = target === "active";
+  if (transition === "reactivate") {
+    // Never reactivate a device whose SITE, AREA or application catalog
+    // has been disabled since its last authorized session.
+    const [{ data: liveSite, error: siteError },
+      { data: liveArea, error: areaError },
+      { data: assignedApps, error: appsError }] = await Promise.all([
+      admin.from("sites").select("id").eq("id", device.site_id)
+        .eq("is_active", true).maybeSingle(),
+      device.area_id
+        ? admin.from("areas").select("id").eq("id", device.area_id)
+          .eq("site_id", device.site_id).eq("is_active", true).maybeSingle()
+        : Promise.resolve({ data: { id: null }, error: null }),
+      admin.from("shared_operational_device_apps").select("app_code")
+        .eq("device_id", id).eq("is_active", true),
+    ]);
+    const assigned = Array.from(new Set(
+      (assignedApps ?? []).map((row) => String(row.app_code)),
+    ));
+    if (siteError || !liveSite || areaError || !liveArea || appsError ||
+        !assigned.length || !assigned.includes(device.default_app_code)) {
+      deviceNotice("conflict");
+    }
+    const { data: liveApps, error: catalogError } = await admin
+      .from("apps").select("code").in("code", assigned).eq("is_active", true);
+    if (catalogError || (liveApps ?? []).length !== assigned.length) {
+      deviceNotice("conflict");
+    }
+  }
+
+  // Unban before activation; while suspended, even an old JWT has no access.
+  if (transition === "reactivate") {
+    const { error: unbanError } = await admin.auth.admin
+      .updateUserById(device.auth_user_id, { ban_duration: "none" });
+    if (unbanError) deviceNotice("reconcile");
+  }
+
+  if (initial !== target || oldActive !== nextActive) {
+    const { data: changed, error: updateError } = await admin
+      .from("shared_operational_devices")
+      .update({ activation_status: target, is_active: nextActive,
+        updated_by: access.user.id, updated_at: new Date().toISOString() })
+      .eq("id", id).eq("activation_status", initial)
+      .eq("is_active", oldActive).select("id").maybeSingle();
+    if (updateError || !changed) {
+      if (transition === "reactivate") {
+        const { error: rebanError } = await admin.auth.admin
+          .updateUserById(device.auth_user_id, { ban_duration: "876000h" });
+        if (rebanError) deviceNotice("reconcile");
+      }
+      deviceNotice("conflict");
+    }
+  }
+
+  if (transition !== "reactivate") {
+    // Fail closed: keep the device inactive even if GoTrue is unavailable.
+    const { error: banError } = await admin.auth.admin
+      .updateUserById(device.auth_user_id, { ban_duration: "876000h" });
+    if (banError) deviceNotice("reconcile");
+  }
+
+  const { error: auditError } = await admin
+    .from("shared_operational_device_events").insert({
+      device_id: id,
+      session_user_id: device.auth_user_id,
+      actor_employee_id: access.user.id,
+      app_code: "viso",
+      site_id: device.site_id,
+      area_id: device.area_id,
+      event_type: eventType,
+      source: "admin",
+      event_payload: {
+        code: device.code,
+        previous_status: initial,
+        new_status: target,
+        auth_account_ban: transition !== "reactivate",
+      },
+    });
+  if (auditError) {
+    // Never announce success without an audit. Reactivation must be undone
+    // because it could otherwise grant access without a recorded event.
+    if (transition === "reactivate") {
+      const { error: undoError } = await admin
+        .from("shared_operational_devices")
+        .update({ activation_status: "suspended", is_active: false,
+          updated_by: access.user.id, updated_at: new Date().toISOString() })
+        .eq("id", id).eq("activation_status", "active");
+      const { error: rebanError } = await admin.auth.admin
+        .updateUserById(device.auth_user_id, { ban_duration: "876000h" });
+      if (undoError || rebanError) deviceNotice("reconcile");
+    }
+    deviceNotice("reconcile");
+  }
+  deviceNotice("updated");
+}
+
+// Authorize before using the service-role client. A NULL-site permission
+// check alone does NOT prove a GLOBAL grant.
+async function requireStaffIndexScope() {
+  const access = await requireAppAccess({
+    appId: "viso",
+    returnTo: "/staff",
+    permissionCode: "workforce.employees.view",
+  });
+  const deny = (): never =>
+    redirect("/no-access?returnTo=%2Fstaff&reason=staff_site_scope_denied&permission=viso.workforce.employees.view");
+  const siteId = String(access.siteId ?? "").trim();
+  if (!isUuid(siteId)) deny();
+
+  const supabase = createAdminClient();
+  let deviceSiteId: string | null = null;
+  if (!access.operationalSession.isSharedDevice) {
+    const { data: operatorSite, error: operatorSiteError } = await supabase
+      .from("employee_sites")
+      .select("employee_id")
+      .eq("employee_id", access.user.id)
+      .eq("site_id", siteId)
+      .eq("is_active", true)
+      .maybeSingle();
+    if (operatorSiteError || !operatorSite) deny();
+    const { data: manageAllowed, error: manageError } = await access.supabase
+      .rpc("has_permission", {
+        p_permission_code: "viso.staff.manage",
+        p_site_id: siteId,
+        p_area_id: null,
+      });
+    if (!manageError && manageAllowed === true) deviceSiteId = siteId;
+  }
+
+  let provenGlobal = false;
+  if (!access.operationalSession.isSharedDevice) {
+    const { data: effective, error: effectiveError } = await access.supabase.rpc(
+      "has_permission", {
+        p_permission_code: STAFF_READ_PERMISSION,
+        p_site_id: null,
+        p_area_id: null,
+      },
+    );
+    if (!effectiveError && effective === true) {
+      const { data: app, error: appError } = await supabase
+        .from("apps")
+        .select("id")
+        .eq("code", "viso")
+        .maybeSingle();
+      if (!appError && app) {
+        const { data: permission, error: permissionError } = await supabase
+          .from("app_permissions")
+          .select("id")
+          .eq("app_id", app.id)
+          .eq("code", "workforce.employees.view")
+          .maybeSingle();
+        if (!permissionError && permission) {
+          const [{ data: employeeGlobal, error: employeeError },
+            { data: roleGlobal, error: roleError }] = await Promise.all([
+            supabase
+              .from("employee_permissions")
+              .select("id")
+              .eq("employee_id", access.user.id)
+              .eq("permission_id", permission.id)
+              .eq("is_allowed", true)
+              .eq("scope_type", "global")
+              .is("scope_site_id", null)
+              .is("scope_area_id", null)
+              .is("scope_site_type", null)
+              .is("scope_area_kind", null)
+              .limit(1)
+              .maybeSingle(),
+            access.operationalSession.role
+              ? supabase
+                .from("role_permissions")
+                .select("permission_id")
+                .eq("role", access.operationalSession.role)
+                .eq("permission_id", permission.id)
+                .eq("is_allowed", true)
+                .or("scope_type.eq.global,scope_type.is.null")
+                .is("scope_site_id", null)
+                .is("scope_area_id", null)
+                .is("scope_site_type", null)
+                .is("scope_area_kind", null)
+                .limit(1)
+                .maybeSingle()
+              : Promise.resolve({ data: null, error: null }),
+          ]);
+          provenGlobal = !employeeError && !roleError && Boolean(employeeGlobal || roleGlobal);
+        }
+      }
+    }
+  }
+
+  if (!provenGlobal) {
+    return { supabase, authorizedSiteIds: [siteId], canReadAllSites: false, deviceSiteId };
+  }
+
+  const { data: sites, error: sitesError } = await supabase.from("sites").select("id");
+  const allSites = sites ?? [];
+  if (sitesError || allSites.length === 0) deny();
+
+  // GLOBAL may still be effectively denied at a particular destination site.
+  const verified = await Promise.all(allSites.map(async (site) => {
+    if (!isUuid(site.id)) return null;
+    const { data, error } = await access.supabase.rpc("has_permission", {
+      p_permission_code: STAFF_READ_PERMISSION,
+      p_site_id: site.id,
+      p_area_id: null,
+    });
+    return !error && data === true ? site.id : null;
+  }));
+  const authorizedSiteIds = Array.from(new Set(verified.filter((id): id is string => Boolean(id))));
+  if (!authorizedSiteIds.includes(siteId)) deny();
+  return {
+    supabase,
+    authorizedSiteIds,
+    canReadAllSites: authorizedSiteIds.length === allSites.length,
+    deviceSiteId,
+  };
+}
+
+// Scope employees in the SQL/PostgREST query, not only in UI rendering.
+async function readScopedStaffIndex(
+  supabase: ReturnType<typeof createAdminClient>,
+  authorizedSiteIds: string[],
+  canReadAllSites: boolean,
+  deviceSiteId: string | null = null,
+) {
+  const employeeQuery = supabase
+    .from("employees")
+    .select("id,full_name,alias,document_type,document_number,role,is_active,employee_sites!inner(site_id)")
+    .in("employee_sites.site_id", authorizedSiteIds)
+    .eq("employee_sites.is_active", true)
+    .order("full_name", { ascending: true });
+  const sitesQuery = supabase
+    .from("sites")
+    .select("id,name,code")
+    .in("id", authorizedSiteIds)
+    .order("name", { ascending: true });
+  // The current admin view contract does not expose site_id. Never fetch
+  // its unscoped rows for a territorially limited operator.
+  const devicesQuery = canReadAllSites
+    ? supabase
+      .from("shared_operational_devices_admin_v1")
+      .select("id,code,label,description,device_type,site_name,site_code,area_name,area_code,default_app_code,allowed_app_codes,activation_status,is_active,last_seen_at,requires_actor_pin,requires_active_actor_shift,allow_actions_without_actor,created_at,updated_at")
+      .order("label", { ascending: true })
+    : deviceSiteId
+      ? supabase
+        .from("shared_operational_devices")
+        .select("id,code,label,description,device_type,site_id,area_id,default_app_code,activation_status,is_active,last_seen_at,requires_actor_pin,requires_active_actor_shift,allow_actions_without_actor,created_at,updated_at,site:sites!shared_operational_devices_site_id_fkey(name,code),area:areas!shared_operational_devices_area_id_fkey(name,code),allowed_apps:shared_operational_device_apps!shared_operational_device_apps_device_id_fkey(app_code,is_active)")
+        .eq("site_id", deviceSiteId).order("label", { ascending: true })
+      : Promise.resolve({ data: [] as SharedDeviceRow[], error: null });
+  return Promise.all([employeeQuery, sitesQuery, devicesQuery] as const);
+}
+
 export default async function StaffPage({
   searchParams,
 }: {
-  searchParams?: Promise<{ site?: string; status?: string; role?: string; tab?: string }>;
+  searchParams?: Promise<{ site?: string; status?: string; role?: string; tab?: string; device_notice?: string }>;
 }) {
-  await requireAppAccess({
-    appId: "viso",
-    returnTo: "/staff",
-    permissionCode: "staff.read",
-  });
-
-  const supabase = createAdminClient();
+  const { supabase, authorizedSiteIds, canReadAllSites, deviceSiteId } = await requireStaffIndexScope();
   const resolvedSearchParams = (await searchParams) ?? {};
-  const tabFilter = resolvedSearchParams.tab === "devices" ? "devices" : "employees";
+  const canViewDevices = canReadAllSites || Boolean(deviceSiteId);
+  const tabFilter = resolvedSearchParams.tab === "devices" && canViewDevices ? "devices" : "employees";
   const siteFilter = typeof resolvedSearchParams.site === "string" ? resolvedSearchParams.site : "all";
-  const statusFilter = typeof resolvedSearchParams.status === "string" ? resolvedSearchParams.status : "active";
+  const statusFilter = resolvedSearchParams.status === "all" || resolvedSearchParams.status === "inactive"
+    ? resolvedSearchParams.status : "active";
   const roleFilter = typeof resolvedSearchParams.role === "string" ? resolvedSearchParams.role : "all";
+  const deviceNoticeLabel: Record<string, string> = {
+    updated: "Estado del dispositivo actualizado, credenciales controladas y evento de auditoría registrado.",
+    unchanged: "El dispositivo ya estaba en ese estado y cuenta con auditoría.",
+    denied: "No tienes autorización para administrar ese dispositivo.",
+    conflict: "El estado del dispositivo cambió. Actualiza la lista antes de reintentar.",
+    reconcile: "No se pudo certificar toda la transición. El dispositivo requiere conciliación administrativa.",
+  };
+  const noticeText = deviceNoticeLabel[String(resolvedSearchParams.device_notice ?? "")] ?? null;
 
   const [
     { data, error: employeesError },
     { data: sitesData },
     { data: sharedDevicesData, error: sharedDevicesError },
-  ] = await Promise.all([
-    supabase
-      .from("employees")
-      .select("id,full_name,alias,document_type,document_number,role,is_active,site_id,site:sites!employees_site_id_fkey(id,name,code)")
-      .order("full_name", { ascending: true }),
-    supabase.from("sites").select("id,name,code").order("name", { ascending: true }),
-    supabase
-      .from("shared_operational_devices_admin_v1")
-      .select("id,code,label,description,device_type,site_name,site_code,area_name,area_code,default_app_code,allowed_app_codes,activation_status,is_active,last_seen_at,requires_actor_pin,requires_active_actor_shift,allow_actions_without_actor,created_at,updated_at")
-      .order("label", { ascending: true }),
-  ]);
+  ] = await readScopedStaffIndex(supabase, authorizedSiteIds, canReadAllSites, deviceSiteId);
 
   if (employeesError) {
     console.error("Staff list query error:", employeesError);
@@ -167,7 +539,23 @@ export default async function StaffPage({
   }
 
   const employees = (data ?? []) as EmployeeRow[];
-  const sharedDevices = (sharedDevicesData ?? []) as SharedDeviceRow[];
+  type ScopedDeviceRow = SharedDeviceRow & {
+    site?: { name: string | null; code: string | null } | null;
+    area?: { name: string | null; code: string | null } | null;
+    allowed_apps?: { app_code: string; is_active: boolean }[];
+  };
+  const sharedDevices: SharedDeviceRow[] = (sharedDevicesData ?? []).map((item) => {
+    const device = item as ScopedDeviceRow;
+    return {
+      ...device,
+      site_name: device.site_name ?? device.site?.name ?? null,
+      site_code: device.site_code ?? device.site?.code ?? null,
+      area_name: device.area_name ?? device.area?.name ?? null,
+      area_code: device.area_code ?? device.area?.code ?? null,
+      allowed_app_codes: device.allowed_app_codes ??
+        (device.allowed_apps ?? []).filter((app) => app.is_active).map((app) => app.app_code),
+    };
+  });
   const sites = ((sitesData ?? []) as SiteLite[]).sort((a, b) => (a.name ?? a.code ?? "").localeCompare(b.name ?? b.code ?? "", "es"));
   const roleOptions = Array.from(new Set(employees.map((employee) => employee.role).filter((role): role is string => Boolean(role)))).sort((a, b) => a.localeCompare(b, "es"));
   const employeeIds = employees.map((employee) => employee.id);
@@ -182,18 +570,29 @@ export default async function StaffPage({
   >();
 
   if (employeeIds.length > 0) {
-    const [{ data: employeeSites }, { data: attendanceRows }, eligibilityRes] = await Promise.all([
-      supabase
-        .from("employee_sites")
-        .select("employee_id,site_id,is_primary,is_active,site:sites!employee_sites_site_id_fkey(id,name,code)")
-        .in("employee_id", employeeIds)
-        .order("is_primary", { ascending: false }),
-      supabase
-        .from("employee_attendance_status")
-        .select("employee_id,current_status,last_action_at,last_site_id")
-        .in("employee_id", employeeIds),
-      supabase.rpc("employee_wallet_eligibility"),
-    ]);
+    const employeeSitesQuery = supabase
+      .from("employee_sites")
+      .select("employee_id,site_id,is_primary,is_active,site:sites!employee_sites_site_id_fkey(id,name,code)")
+      .in("employee_id", employeeIds)
+      .in("site_id", authorizedSiteIds)
+      .eq("is_active", true)
+      .order("is_primary", { ascending: false });
+    const attendanceQuery = supabase
+      .from("employee_attendance_status")
+      .select("employee_id,current_status,last_action_at,last_site_id")
+      .in("employee_id", employeeIds)
+      .in("last_site_id", authorizedSiteIds);
+    // This RPC returns global eligibility. Do not disclose cross-site
+    // readiness to SITE-limited readers.
+    const eligibilityQuery = canReadAllSites
+      ? supabase.rpc("employee_wallet_eligibility")
+      : Promise.resolve({ data: [] as Array<{
+        employee_id: string;
+        contract_active: boolean;
+        documents_complete: boolean;
+      }> });
+    const [{ data: employeeSites }, { data: attendanceRows }, eligibilityRes] =
+      await Promise.all([employeeSitesQuery, attendanceQuery, eligibilityQuery]);
 
     linksByEmployee = (employeeSites ?? []).reduce((map, row) => {
       const link = row as EmployeeSiteLink;
@@ -209,7 +608,9 @@ export default async function StaffPage({
       return map;
     }, new Map<string, AttendanceStatusRow>());
 
+    const visibleEmployeeIds = new Set(employeeIds);
     (eligibilityRes?.data ?? []).forEach((row: { employee_id: string; contract_active: boolean; documents_complete: boolean }) => {
+      if (!visibleEmployeeIds.has(row.employee_id)) return;
       cardReadinessByEmployee.set(row.employee_id, {
         contract_active: row.contract_active,
         documents_complete: row.documents_complete,
@@ -220,7 +621,6 @@ export default async function StaffPage({
   const filteredEmployees = employees.filter((employee) => {
     const matchesSite =
       siteFilter === "all" ||
-      employee.site_id === siteFilter ||
       (linksByEmployee.get(employee.id) ?? []).some((link) => link.site_id === siteFilter);
 
     const matchesStatus =
@@ -254,15 +654,23 @@ export default async function StaffPage({
             <Link href="/staff/schedule" className="ui-btn ui-btn--ghost">
               Horario semanal
             </Link>
-            <Link href="/staff/shared-devices/new" className="ui-btn ui-btn--ghost">
-              Crear dispositivo compartido
-            </Link>
+            {canViewDevices ? (
+              <Link href="/staff/shared-devices/new" className="ui-btn ui-btn--ghost">
+                Crear dispositivo compartido
+              </Link>
+            ) : null}
             <Link href="/staff/new" className="ui-btn ui-btn--brand">
               Invitar trabajador
             </Link>
           </div>
         }
       />
+
+      {noticeText ? (
+        <div className="ui-panel" role="status">
+          <p className="text-sm font-medium">{noticeText}</p>
+        </div>
+      ) : null}
 
       {tabFilter === "employees" ? (
         <form method="get" className="flex flex-wrap items-end gap-3 rounded-2xl border border-[var(--ui-border)] bg-white/80 px-4 py-3">
@@ -306,7 +714,7 @@ export default async function StaffPage({
           { value: "employees:active", href: `/staff?tab=employees&site=${encodeURIComponent(siteFilter)}&role=${encodeURIComponent(roleFilter)}&status=active`, label: "Activos", count: activeEmployeeCount, active: tabFilter === "employees" && statusFilter === "active" },
           { value: "employees:inactive", href: `/staff?tab=employees&site=${encodeURIComponent(siteFilter)}&role=${encodeURIComponent(roleFilter)}&status=inactive`, label: "Inactivos", count: inactiveEmployeeCount, active: tabFilter === "employees" && statusFilter === "inactive" },
           { value: "employees:all", href: `/staff?tab=employees&site=${encodeURIComponent(siteFilter)}&role=${encodeURIComponent(roleFilter)}&status=all`, label: "Todos", count: employees.length, active: tabFilter === "employees" && statusFilter === "all" },
-          { value: "devices", href: "/staff?tab=devices&status=all", label: "Dispositivos compartidos", count: sharedDevices.length, active: tabFilter === "devices" },
+          ...(canViewDevices ? [{ value: "devices", href: "/staff?tab=devices&status=all", label: "Dispositivos compartidos", count: sharedDevices.length, active: tabFilter === "devices" }] : []),
         ].map((option) => (
           <Link
             key={option.value}
@@ -319,7 +727,7 @@ export default async function StaffPage({
         ))}
       </div>
 
-      <div className="ui-panel ui-panel--accent-brand">
+      <div className="ui-panel ui-panel--accent-brand min-w-0 max-w-full overflow-x-auto">
         {tabFilter === "devices" ? (
           filteredSharedDevices.length === 0 ? (
             <div className="ui-empty flex flex-col items-center gap-4 py-12">
@@ -396,9 +804,40 @@ export default async function StaffPage({
                         <div className="ui-caption">{device.activation_status}</div>
                       </TableCell>
                       <TableCell className="text-right">
-                        <Link href={`/staff/shared-devices/${device.id}`} className="ui-btn ui-btn--ghost ui-btn--sm">
-                          Editar
-                        </Link>
+                        <div className="flex flex-col items-end gap-2">
+                          {(device.activation_status === "active" ||
+                            device.activation_status === "pending_activation") ? (
+                            <form action={changeSharedDeviceState}>
+                              <input type="hidden" name="device_id" value={device.id} />
+                              <input type="hidden" name="transition" value="suspend" />
+                              <button className="ui-btn ui-btn--ghost ui-btn--sm" type="submit">
+                                Suspender
+                              </button>
+                            </form>
+                          ) : null}
+                          {device.activation_status === "suspended" ? (
+                            <form action={changeSharedDeviceState}>
+                              <input type="hidden" name="device_id" value={device.id} />
+                              <input type="hidden" name="transition" value="reactivate" />
+                              <button className="ui-btn ui-btn--ghost ui-btn--sm" type="submit">
+                                Reactivar
+                              </button>
+                            </form>
+                          ) : null}
+                          {device.activation_status !== "revoked" ? (
+                            <form action={changeSharedDeviceState} className="flex flex-col items-end gap-1">
+                              <input type="hidden" name="device_id" value={device.id} />
+                              <input type="hidden" name="transition" value="revoke" />
+                              <label className="ui-caption flex items-center gap-1">
+                                <input type="checkbox" name="confirm_revocation" value="yes" required />
+                                Confirmar revocación
+                              </label>
+                              <button className="ui-btn ui-btn--ghost ui-btn--sm" type="submit">
+                                Revocar
+                              </button>
+                            </form>
+                          ) : null}
+                        </div>
                       </TableCell>
                     </TableRow>
                   );
@@ -440,9 +879,8 @@ export default async function StaffPage({
             </TableHead>
             <TableBody>
               {filteredEmployees.map((employee) => {
-                const directSite = Array.isArray(employee.site) ? employee.site[0] ?? null : employee.site ?? null;
                 const links = linksByEmployee.get(employee.id) ?? [];
-                const primaryLink = links.find((link) => link.is_primary) ?? null;
+                const primaryLink = links.find((link) => link.is_primary) ?? links[0] ?? null;
                 const primarySite = primaryLink
                   ? Array.isArray(primaryLink.site)
                     ? primaryLink.site[0] ?? null
@@ -477,7 +915,7 @@ export default async function StaffPage({
                     </TableCell>
                     <TableCell>{employee.role ?? "-"}</TableCell>
                     <TableCell>
-                      <div>{primarySite?.name ?? directSite?.name ?? "Sin sede principal"}</div>
+                      <div>{primarySite?.name ?? "Sin sede asignada"}</div>
                       <div className="ui-caption">
                         {siteNames.length > 0
                           ? `${siteNames.length} sede(s): ${siteNames.slice(0, 2).join(", ")}${siteNames.length > 2 ? "..." : ""}`

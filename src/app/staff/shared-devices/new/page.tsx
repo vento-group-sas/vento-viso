@@ -82,24 +82,25 @@ function uniqueAppCodes(values: string[]) {
   return Array.from(new Set(values.map((value) => value.trim().toLowerCase()).filter(Boolean)));
 }
 
-export async function createSharedDeviceAction(
+async function createSharedDeviceAction(
   _prevState: SharedDeviceCreateState,
   formData: FormData,
 ): Promise<SharedDeviceCreateState> {
   "use server";
 
-  const { user } = await requireAppAccess({
+  const access = await requireAppAccess({
     appId: "viso",
     returnTo: "/staff/shared-devices/new",
     permissionCode: "staff.manage",
   });
+  const { user } = access;
 
   const admin = createAdminClient();
 
   const templateId = textValue(formData, "template_id");
   const label = textValue(formData, "label");
   const rawCode = textValue(formData, "code");
-  let code = normalizeDeviceCode(rawCode || label);
+  const code = normalizeDeviceCode(rawCode || label);
   const description = textValue(formData, "description") || null;
   const siteId = textValue(formData, "site_id");
   const areaId = textValue(formData, "area_id") || null;
@@ -131,6 +132,86 @@ export async function createSharedDeviceAction(
       status: "error",
       message: "Selecciona la sede del dispositivo.",
     };
+  }
+
+  // The submitted site/area are untrusted. The initial app guard checks the
+  // operator's active session, NOT authority over a different destination.
+  // Fail closed before provisioning an Auth user with service_role.
+  const denyTerritory = (): SharedDeviceCreateState => ({
+    status: "error",
+    message: "No tienes autorización para crear un dispositivo en la sede o área solicitada.",
+  });
+  const isUuid = (value: string) =>
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value);
+  const operatorSiteId = String(access.siteId ?? "").trim();
+  if (access.operationalSession.isSharedDevice ||
+      !isUuid(operatorSiteId) || !isUuid(siteId) ||
+      (areaId !== null && !isUuid(areaId))) {
+    return denyTerritory();
+  }
+
+  const [
+    { data: operatorSite, error: operatorSiteError },
+    { data: destination, error: destinationError },
+  ] = await Promise.all([
+    admin.from("employee_sites").select("employee_id")
+      .eq("employee_id", user.id).eq("site_id", operatorSiteId)
+      .eq("is_active", true).maybeSingle(),
+    admin.from("sites").select("id")
+      .eq("id", siteId).eq("is_active", true).maybeSingle(),
+  ]);
+  if (operatorSiteError || !operatorSite || destinationError || !destination) {
+    return denyTerritory();
+  }
+
+  const { data: targetAllowed, error: targetPermissionError } =
+    await access.supabase.rpc("has_permission", {
+      p_permission_code: "viso.staff.manage",
+      p_site_id: siteId,
+      p_area_id: areaId,
+    });
+  if (targetPermissionError || targetAllowed !== true) return denyTerritory();
+
+  if (siteId !== operatorSiteId) {
+    // An effective permission evaluated with a target site is necessary but
+    // cross-site administration also requires explicit GLOBAL provenance.
+    // A SITE grant (or a NULL-site RPC result) must never imply GLOBAL scope.
+    const { data: app, error: appError } = await admin
+      .from("apps").select("id").eq("code", "viso").maybeSingle();
+    if (appError || !app) return denyTerritory();
+    const { data: permission, error: permissionError } = await admin
+      .from("app_permissions").select("id").eq("app_id", app.id)
+      .eq("code", "staff.manage").eq("is_active", true).maybeSingle();
+    if (permissionError || !permission) return denyTerritory();
+
+    const [{ data: employeeGlobal, error: employeeError },
+      { data: roleGlobal, error: roleError }] = await Promise.all([
+      admin.from("employee_permissions").select("id")
+        .eq("employee_id", user.id).eq("permission_id", permission.id)
+        .eq("is_allowed", true).eq("scope_type", "global")
+        .is("scope_site_id", null).is("scope_area_id", null)
+        .is("scope_site_type", null).is("scope_area_kind", null)
+        .limit(1).maybeSingle(),
+      access.operationalSession.role
+        ? admin.from("role_permissions").select("permission_id")
+          .eq("role", access.operationalSession.role)
+          .eq("permission_id", permission.id).eq("is_allowed", true)
+          .or("scope_type.eq.global,scope_type.is.null")
+          .is("scope_site_id", null).is("scope_area_id", null)
+          .is("scope_site_type", null).is("scope_area_kind", null)
+          .limit(1).maybeSingle()
+        : Promise.resolve({ data: null, error: null }),
+    ]);
+    if (employeeError || roleError || (!employeeGlobal && !roleGlobal)) {
+      return denyTerritory();
+    }
+  }
+
+  if (areaId !== null) {
+    const { data: targetArea, error: areaError } = await admin
+      .from("areas").select("id").eq("id", areaId)
+      .eq("site_id", siteId).eq("is_active", true).maybeSingle();
+    if (areaError || !targetArea) return denyTerritory();
   }
 
   const { data: template, error: templateError } = await admin
@@ -195,33 +276,39 @@ export async function createSharedDeviceAction(
     };
   }
 
-  const baseCode = code;
-  let resolvedCode = "";
-
-  for (let suffix = 1; suffix <= 99; suffix += 1) {
-    const candidateCode =
-      suffix === 1 ? baseCode : `${baseCode}_${String(suffix).padStart(2, "0")}`;
-
-    const { data: existingDevice } = await admin
-      .from("shared_operational_devices")
-      .select("id")
-      .eq("code", candidateCode)
-      .maybeSingle();
-
-    if (!existingDevice) {
-      resolvedCode = candidateCode;
-      break;
-    }
-  }
-
-  if (!resolvedCode) {
+  // El formulario permite personalizar apps. Validar cada codigo recibido
+  // contra el catalogo activo antes de crear un usuario tecnico con service_role.
+  const { data: activeApps, error: activeAppsError } = await admin
+    .from("apps")
+    .select("code")
+    .in("code", appCodes)
+    .eq("is_active", true);
+  const activeAppCodes = new Set(
+    (activeApps ?? []).map((app) => String(app.code ?? "").toLowerCase()),
+  );
+  if (activeAppsError || appCodes.some((appCode) => !activeAppCodes.has(appCode))) {
     return {
       status: "error",
-      message: `No se pudo generar un código disponible para ${baseCode}.`,
+      message: "Las aplicaciones seleccionadas deben existir y estar activas en el catálogo.",
     };
   }
 
-  code = resolvedCode;
+  // El código es la identidad estable del dispositivo. Repetir el formulario
+  // no debe inventar un codigo con sufijo y aprovisionar otra cuenta tecnica.
+  // Un segundo dispositivo necesita un codigo distinto introducido por el operador.
+  const { data: existingDevice, error: existingDeviceError } = await admin
+    .from("shared_operational_devices")
+    .select("id")
+    .eq("code", code)
+    .maybeSingle();
+  if (existingDeviceError || existingDevice) {
+    return {
+      status: "error",
+      message: existingDeviceError
+        ? "No se pudo comprobar la disponibilidad del código. Reintenta sin crear otra cuenta."
+        : "Ya existe un dispositivo con ese código. Consulta el dispositivo existente antes de reintentar; para crear otro, utiliza un código diferente.",
+    };
+  }
 
   const loginEmail = requestedLoginEmail || `${code.toLowerCase()}@devices.ventogroup.co`;
 
@@ -260,119 +347,179 @@ export async function createSharedDeviceAction(
   }
 
   const authUserId = authRes.user.id;
+  let createdDeviceId: string | null = null;
 
-  const { data: device, error: deviceError } = await admin
-    .from("shared_operational_devices")
-    .insert({
-      code,
-      label,
-      description,
-      device_type: template.device_type,
-      auth_user_id: authUserId,
-      site_id: siteId,
-      area_id: areaId,
-      default_app_code: defaultAppCode,
-      template_id: template.id,
-      requires_actor_pin: boolValue(formData, "requires_actor_pin"),
-      requires_active_actor_shift: boolValue(formData, "requires_active_actor_shift"),
-      allow_actor_without_pin: boolValue(formData, "allow_actor_without_pin"),
-      allow_actions_without_actor: boolValue(formData, "allow_actions_without_actor"),
-      activation_status: "active",
-      is_active: true,
-      created_by: user.id,
-      updated_by: user.id,
-      metadata: {
-        login_email: loginEmail,
-        template_id: template.id,
-        template_code: template.code,
-        created_from: "viso_staff_shared_devices",
-      },
-    })
-    .select("id")
-    .single();
-
-  if (deviceError || !device) {
-    await admin.auth.admin.deleteUser(authUserId);
+  // Auth y PostgreSQL son transacciones independientes. Si una etapa falla,
+  // verificar la reversa en ambas; nunca anunciar exito ni ocultar residuos.
+  const compensateFailedProvision = async (reason: string): Promise<SharedDeviceCreateState> => {
+    let deviceRemoved = false;
+    let accountRemoved = false;
+    let idToRemove = createdDeviceId;
+    if (!idToRemove) {
+      // La insercion pudo confirmarse en Postgres aunque se perdiera su respuesta.
+      try {
+        const { data: found, error: lookupError } = await admin
+          .from("shared_operational_devices").select("id")
+          .eq("auth_user_id", authUserId).maybeSingle();
+        if (!lookupError) {
+          idToRemove = found?.id ?? null;
+          deviceRemoved = !found;
+        }
+      } catch {
+        deviceRemoved = false;
+      }
+    }
+    if (idToRemove) {
+      try {
+        const { data: deleted, error: deleteError } = await admin
+          .from("shared_operational_devices").delete().eq("id", idToRemove)
+          .select("id");
+        deviceRemoved = !deleteError && Boolean(
+          deleted?.some((item) => item.id === idToRemove),
+        );
+      } catch {
+        deviceRemoved = false;
+      }
+    }
+    try {
+      const { error: deleteUserError } = await admin.auth.admin.deleteUser(authUserId);
+      accountRemoved = !deleteUserError;
+    } catch {
+      accountRemoved = false;
+    }
+    if (!accountRemoved) {
+      // Una cuenta huerfana no debe aceptar nuevos inicios de sesion.
+      // El token emitido previamente exige controles adicionales por consumidor.
+      try {
+        await admin.auth.admin.updateUserById(authUserId, { ban_duration: "876000h" });
+      } catch {
+        // El estado queda en conciliacion, nunca en exito.
+      }
+    }
     return {
       status: "error",
-      message: deviceError?.message || "No se pudo crear el registro del dispositivo.",
+      message: deviceRemoved && accountRemoved
+        ? reason + " Se revirtió la creación. Revisa el registro antes de reintentar."
+        : reason + " La reversa requiere conciliación administrativa antes de reintentar.",
     };
-  }
+  };
 
-  const { error: appsError } = await admin
-    .from("shared_operational_device_apps")
-    .insert(
-      appCodes.map((appCode) => ({
-        device_id: device.id,
-        app_code: appCode,
-        is_default: appCode === defaultAppCode,
+  try {
+    const { data: device, error: deviceError } = await admin
+      .from("shared_operational_devices")
+      .insert({
+        code,
+        label,
+        description,
+        device_type: template.device_type,
+        auth_user_id: authUserId,
+        site_id: siteId,
+        area_id: areaId,
+        default_app_code: defaultAppCode,
+        template_id: template.id,
+        requires_actor_pin: boolValue(formData, "requires_actor_pin"),
+        requires_active_actor_shift: boolValue(formData, "requires_active_actor_shift"),
+        allow_actor_without_pin: boolValue(formData, "allow_actor_without_pin"),
+        allow_actions_without_actor: boolValue(formData, "allow_actions_without_actor"),
+        activation_status: "active",
         is_active: true,
-      })),
+        created_by: user.id,
+        updated_by: user.id,
+        metadata: {
+          login_email: loginEmail,
+          template_id: template.id,
+          template_code: template.code,
+          created_from: "viso_staff_shared_devices",
+        },
+      })
+      .select("id")
+      .single();
+
+    if (deviceError || !device) {
+      return compensateFailedProvision("No se pudo crear el registro del dispositivo.");
+    }
+    createdDeviceId = device.id;
+
+    const { error: appsError } = await admin
+      .from("shared_operational_device_apps")
+      .insert(
+        appCodes.map((appCode) => ({
+          device_id: device.id,
+          app_code: appCode,
+          is_default: appCode === defaultAppCode,
+          is_active: true,
+        })),
+      );
+
+    if (appsError) {
+      return compensateFailedProvision("No se pudieron asignar las apps del dispositivo.");
+    }
+
+    const { error: policiesError } = await admin.rpc(
+      "apply_shared_device_template_actor_policies_v1",
+      {
+        p_device_id: device.id,
+        p_template_id: template.id,
+      },
     );
 
-  if (appsError) {
-    await admin.from("shared_operational_devices").delete().eq("id", device.id);
-    await admin.auth.admin.deleteUser(authUserId);
+    if (policiesError) {
+      return compensateFailedProvision("No se pudieron copiar las políticas de actor de la plantilla.");
+    }
+
+    // A device cannot be reported as provisioned without its audit event.
+    // A DB/network failure after Auth provisioning must fail closed, even
+    // though Auth and Postgres are separate transactions.
+    let auditConfirmed = false;
+    try {
+      const { error: auditError } = await admin
+        .from("shared_operational_device_events").insert({
+          device_id: device.id,
+          session_user_id: authUserId,
+          actor_employee_id: user.id,
+          app_code: "viso",
+          site_id: siteId,
+          area_id: areaId,
+          event_type: "device.created",
+          source: "admin",
+          event_payload: {
+            code,
+            label,
+            login_email: loginEmail,
+            template_id: template.id,
+            template_code: template.code,
+            app_codes: appCodes,
+            default_app_code: defaultAppCode,
+          },
+        });
+      auditConfirmed = !auditError;
+    } catch {
+      auditConfirmed = false;
+    }
+    if (!auditConfirmed) {
+      return compensateFailedProvision("No se confirmó la auditoría.");
+    }
+
     return {
-      status: "error",
-      message: appsError.message || "No se pudieron asignar las apps del dispositivo.",
+      status: "success",
+      message: "Dispositivo compartido creado y activado.",
+      device: {
+        id: device.id,
+        code,
+        label,
+        loginEmail,
+        temporaryPassword,
+        defaultAppCode,
+        appCodes,
+        templateCode: template.code,
+        templateLabel: template.label,
+      },
     };
+  } catch {
+    // Tambien cubre fallos de red que arrojan excepciones antes de devolver
+    // una respuesta PostgREST o RPC; la cuenta ya existe en GoTrue.
+    return compensateFailedProvision("No se pudo confirmar el aprovisionamiento.");
   }
-
-  const { error: policiesError } = await admin.rpc(
-    "apply_shared_device_template_actor_policies_v1",
-    {
-      p_device_id: device.id,
-      p_template_id: template.id,
-    },
-  );
-
-  if (policiesError) {
-    await admin.from("shared_operational_devices").delete().eq("id", device.id);
-    await admin.auth.admin.deleteUser(authUserId);
-    return {
-      status: "error",
-      message:
-        policiesError.message ||
-        "No se pudieron copiar las políticas de actor de la plantilla.",
-    };
-  }
-
-  await admin.from("shared_operational_device_events").insert({
-    device_id: device.id,
-    session_user_id: authUserId,
-    actor_employee_id: user.id,
-    app_code: "viso",
-    site_id: siteId,
-    area_id: areaId,
-    event_type: "device.created",
-    source: "admin",
-    event_payload: {
-      code,
-      label,
-      login_email: loginEmail,
-      template_id: template.id,
-      template_code: template.code,
-      app_codes: appCodes,
-      default_app_code: defaultAppCode,
-    },
-  });
-
-  return {
-    status: "success",
-    message: "Dispositivo compartido creado y activado.",
-    device: {
-      id: device.id,
-      code,
-      label,
-      loginEmail,
-      temporaryPassword,
-      defaultAppCode,
-      appCodes,
-      templateCode: template.code,
-      templateLabel: template.label,
-    },
-  };
 }
 
 export default async function SharedDeviceCreatePage() {

@@ -328,7 +328,7 @@ export function SharedDeviceCreateForm({
             </div>
           </div>
           <p className="mt-3 text-xs text-[var(--ui-muted)]">
-            Si el código ya existe, el sistema agregará un sufijo automático como _02.
+            Si el código ya existe, no se creará otro dispositivo. Para registrar un equipo diferente, usa otro código en Configuración avanzada de identidad.
           </p>
         </div>
 

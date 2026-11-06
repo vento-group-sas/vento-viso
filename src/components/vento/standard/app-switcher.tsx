@@ -109,7 +109,7 @@ function AppTile({
       ? "ui-app-icon-fallback"
       : "ui-app-icon-fallback opacity-35 grayscale";
 
-  const logoNode = logoError ? (
+  const logoNode = logoError || !app.logoSrc ? (
     <div
       className={fallbackClassName}
       style={isShell ? { width: logoWidth, height: logoHeight } : undefined}
