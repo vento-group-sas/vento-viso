@@ -57,6 +57,13 @@ export const config = {
 };
 
 export async function middleware(request: NextRequest) {
+  const isCatalogoAdmin = request.nextUrl.pathname === "/admin/catalogo" ||
+    request.nextUrl.pathname.startsWith("/admin/catalogo/");
+  // La ruta y su callback administran su propia sesión. No eliminar aquí la
+  // cookie verificadora PKCE antes del canje de un enlace de acceso por correo.
+  if (isCatalogoAdmin) {
+    return withDebugHeaders(NextResponse.next(), request, "catalogo-pkce");
+  }
   if (!hasSupabaseCookies(request)) {
     return withDebugHeaders(buildLoginRedirect(request), request, "no-cookies");
   }
