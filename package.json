@@ -9,10 +9,11 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "npm run test:ci011",
+    "test": "npm run test:catalogo && npm run test:ci011",
     "test:ci011": "node --test scripts/quality/viso-consumer-baseline-gate.test.mjs",
     "ci011:baseline": "node scripts/quality/viso-consumer-baseline-gate.mjs --packages=@vento/contracts,@vento/os-context,@vento/supabase,@vento/ui-web --json",
-    "audit:i18n": "node scripts/audit-i18n.mjs"
+    "audit:i18n": "node scripts/audit-i18n.mjs",
+    "test:catalogo": "node --experimental-strip-types --test scripts/quality/catalogo-security.test.mjs && eslint middleware.ts src/lib/catalogo-policy.ts src/lib/catalogo-auth.ts src/app/admin/catalogo src/app/api/catalogo && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@supabase/ssr": "^0.8.0",
@@ -20,10 +21,10 @@
     "barcode-detector-api-polyfill": "^1.0.20",
     "bwip-js": "^4.1.0",
     "exceljs": "^4.4.0",
-    "next": "^16.1.6",
+    "next": "16.4.2",
     "react": "19.2.3",
     "react-dom": "19.2.3",
-    "sharp": "^0.35.2"
+    "sharp": "0.35.5"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -31,8 +32,19 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "16.1.1",
+    "eslint-config-next": "16.4.2",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "11.1.1"
+    },
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "11.0.3"
+    },
+    "eslint-plugin-react-hooks": {
+      "zod": "4.6.7"
+    }
   }
 }
