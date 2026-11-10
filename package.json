@@ -9,13 +9,14 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "npm run test:ci011 && npm run test:xlsx && npm run test:security && npm run audit:security",
+    "test": "npm run test:catalogo && npm run test:ci011 && npm run test:xlsx && npm run test:security && npm run audit:security",
     "test:ci011": "node --test scripts/quality/viso-consumer-baseline-gate.test.mjs",
     "test:xlsx": "node --test scripts/quality/viso-exceljs-uuid-xlsx.test.mjs",
     "test:security": "node --test scripts/quality/viso-dependency-security-gate.test.mjs",
     "audit:security": "node scripts/quality/viso-dependency-security-gate.mjs",
     "ci011:baseline": "node scripts/quality/viso-consumer-baseline-gate.mjs --packages=@vento/contracts,@vento/os-context,@vento/supabase,@vento/ui-web --json",
-    "audit:i18n": "node scripts/audit-i18n.mjs"
+    "audit:i18n": "node scripts/audit-i18n.mjs",
+    "test:catalogo": "node --experimental-strip-types --test scripts/quality/catalogo-security.test.mjs && eslint middleware.ts src/lib/catalogo-policy.ts src/lib/catalogo-auth.ts src/app/admin/catalogo src/app/api/catalogo && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@supabase/ssr": "^0.8.0",
@@ -31,6 +32,12 @@
   "overrides": {
     "exceljs": {
       "uuid": "11.1.1"
+    },
+    "@typescript-eslint/typescript-estree": {
+      "minimatch": "11.0.3"
+    },
+    "eslint-plugin-react-hooks": {
+      "zod": "4.6.7"
     }
   },
   "devDependencies": {
