@@ -16,7 +16,7 @@
     "audit:security": "node scripts/quality/viso-dependency-security-gate.mjs",
     "ci011:baseline": "node scripts/quality/viso-consumer-baseline-gate.mjs --packages=@vento/contracts,@vento/os-context,@vento/supabase,@vento/ui-web --json",
     "audit:i18n": "node scripts/audit-i18n.mjs",
-    "test:catalogo": "node --experimental-strip-types --test scripts/quality/catalogo-security.test.mjs"
+    "test:catalogo": "node --experimental-strip-types --test scripts/quality/catalogo-security.test.mjs && eslint middleware.ts src/lib/catalogo-policy.ts src/lib/catalogo-auth.ts src/app/admin/catalogo src/app/api/catalogo && npm run typecheck && npm run build"
   },
   "dependencies": {
     "@supabase/ssr": "^0.8.0",
