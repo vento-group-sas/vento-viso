@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useRef, useState, type FormEvent } from "react";
 
 import { createClient } from "@/lib/supabase/client";
 
@@ -29,7 +29,7 @@ export function CatalogoClient({ authorized, currentEmail, invalidLink }: Props)
   const [success, setSuccess] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  async function sendLink(event: React.FormEvent<HTMLFormElement>) {
+  async function sendLink(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setMessage("");
@@ -49,7 +49,7 @@ export function CatalogoClient({ authorized, currentEmail, invalidLink }: Props)
     }
   }
 
-  async function replaceCatalog(event: React.FormEvent<HTMLFormElement>) {
+  async function replaceCatalog(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!file || busy) return;
     setBusy(true);
