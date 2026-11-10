@@ -59,12 +59,16 @@ export const config = {
 export async function middleware(request: NextRequest) {
   const isCatalogoAdmin = request.nextUrl.pathname === "/admin/catalogo" ||
     request.nextUrl.pathname.startsWith("/admin/catalogo/");
-  if (!hasSupabaseCookies(request) && !isCatalogoAdmin) {
+  // La ruta y su callback administran su propia sesión. No eliminar aquí la
+  // cookie verificadora PKCE antes del canje de un enlace de acceso por correo.
+  if (isCatalogoAdmin) {
+    return withDebugHeaders(NextResponse.next(), request, "catalogo-pkce");
+  }
+  if (!hasSupabaseCookies(request)) {
     return withDebugHeaders(buildLoginRedirect(request), request, "no-cookies");
   }
 
   const response = NextResponse.next();
-  if (isCatalogoAdmin && !hasSupabaseCookies(request)) return response;
 
   const url =
     process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL || "";
@@ -75,7 +79,6 @@ export async function middleware(request: NextRequest) {
     "";
 
   if (!url || !key) {
-    if (isCatalogoAdmin) return withDebugHeaders(response, request, "no-config");
     return withDebugHeaders(buildLoginRedirect(request), request, "no-config");
   }
 
@@ -97,13 +100,13 @@ export async function middleware(request: NextRequest) {
     const result = await supabase.auth.getUser();
     data = result.data;
   } catch {
-    const redirect = isCatalogoAdmin ? response : buildLoginRedirect(request);
+    const redirect = buildLoginRedirect(request);
     clearSupabaseCookies(request, redirect);
     return withDebugHeaders(redirect, request, "auth-error");
   }
 
   if (!data.user) {
-    const redirect = isCatalogoAdmin ? response : buildLoginRedirect(request);
+    const redirect = buildLoginRedirect(request);
     clearSupabaseCookies(request, redirect);
     return withDebugHeaders(redirect, request, "no-user");
   }

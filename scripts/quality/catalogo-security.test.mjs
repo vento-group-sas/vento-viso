@@ -50,3 +50,13 @@ test("el nuevo catálogo debe tener firma PDF y tamaño permitido", () => {
   assert.equal(isValidPdfBytes(Buffer.from("%PDF-1.7\nSIN FINAL")), false);
   assert.equal(isValidPdfBytes(Buffer.alloc(CATALOGO_MAX_BYTES + 1)), false);
 });
+
+test("el callback conserva la cookie PKCE antes de canjear el enlace", async () => {
+  const { readFileSync } = await import("node:fs");
+  const middleware = readFileSync(new URL("../../middleware.ts", import.meta.url), "utf8");
+  const bypass = middleware.indexOf('if (isCatalogoAdmin) {');
+  const keepVerifier = middleware.indexOf('return withDebugHeaders(NextResponse.next(), request, "catalogo-pkce")');
+  const sessionRead = middleware.indexOf("const result = await supabase.auth.getUser()");
+  assert.ok(bypass >= 0 && keepVerifier > bypass && sessionRead > keepVerifier);
+  assert.ok(!middleware.slice(bypass, keepVerifier).includes("clearSupabaseCookies"));
+});
